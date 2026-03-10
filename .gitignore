@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+**.pyc
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local env
+.env
+.venv/
+venv/
+
+# Runtime logs
+*.log
+logs/
+
+# Model assets / compiled outputs
+compiled_models/
+whisper_pretrained/
+vad_pretrained/
+
+# Generated artifacts
+mindie_whisperx/pipeline/mel_filters.npz
