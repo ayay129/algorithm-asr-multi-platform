@@ -1,0 +1,20 @@
+--- voice_activity_detection.py	2024-11-11 12:06:17.300126910 +0800
++++ whisperX_update/voice_activity_detection.py	2024-11-13 15:31:35.374394983 +0800
+@@ -112,6 +112,7 @@
+         segmentation: PipelineModel = "pyannote/segmentation",
+         fscore: bool = False,
+         use_auth_token: Union[Text, None] = None,
++        ts_model_path: str = None,
+         **inference_kwargs,
+     ):
+         super().__init__()
+@@ -125,6 +126,9 @@
+         inference_kwargs["pre_aggregation_hook"] = lambda scores: np.max(
+             scores, axis=-1, keepdims=True
+         )
++        if ts_model_path is not None:
++            inference_kwargs["ts_model_path"] = ts_model_path
++
+         self._segmentation = Inference(model, **inference_kwargs)
+ 
+         if model.specifications.powerset:

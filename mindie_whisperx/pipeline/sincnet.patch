@@ -1,0 +1,26 @@
+--- sincnet.py	2024-10-28 11:12:11.613267085 +0800
++++ whisperX_update/sincnet.py	2024-11-19 16:37:54.780795192 +0800
+@@ -80,16 +80,14 @@
+ 
+         outputs = self.wav_norm1d(waveforms)
+ 
+-        for c, (conv1d, pool1d, norm1d) in enumerate(
+-            zip(self.conv1d, self.pool1d, self.norm1d)
+-        ):
++        outputs = self.conv1d[0](outputs)
++        outputs = torch.abs(outputs)
++        outputs = F.leaky_relu(self.norm1d[0](self.pool1d[0](outputs)))
+ 
+-            outputs = conv1d(outputs)
++        outputs = self.conv1d[1](outputs)
++        outputs = F.leaky_relu(self.norm1d[1](self.pool1d[1](outputs)))
+ 
+-            # https://github.com/mravanelli/SincNet/issues/4
+-            if c == 0:
+-                outputs = torch.abs(outputs)
+-
+-            outputs = F.leaky_relu(norm1d(pool1d(outputs)))
++        outputs = self.conv1d[2](outputs)
++        outputs = F.leaky_relu(self.norm1d[2](self.pool1d[2](outputs)))
+ 
+         return outputs

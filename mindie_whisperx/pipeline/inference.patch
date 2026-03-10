@@ -1,0 +1,33 @@
+--- inference.py	2024-10-28 11:12:54.877267615 +0800
++++ whisperX_update/inference.py	2024-11-11 12:10:57.696130346 +0800
+@@ -94,6 +94,7 @@
+         device: torch.device = None,
+         batch_size: int = 32,
+         use_auth_token: Union[Text, None] = None,
++        ts_model_path: str = None
+     ):
+         # ~~~~ model ~~~~~
+ 
+@@ -115,6 +116,10 @@
+         self.model.eval()
+         self.model.to(self.device)
+ 
++        self.ts_model = None
++        if ts_model_path is not None:
++            self.ts_model = torch.jit.load(ts_model_path)
++
+         specifications = self.model.specifications
+ 
+         # ~~~~ sliding window ~~~~~
+@@ -214,7 +219,10 @@
+ 
+         with torch.inference_mode():
+             try:
+-                outputs = self.model(chunks.to(self.device))
++                if self.ts_model is not None:
++                    outputs = self.ts_model(chunks.contiguous().to("npu")).to(self.device)
++                else:
++                    outputs = self.model(chunks.to(self.device))
+             except RuntimeError as exception:
+                 if is_oom_error(exception):
+                     raise MemoryError(
