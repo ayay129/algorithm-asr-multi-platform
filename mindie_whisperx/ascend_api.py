@@ -7,7 +7,9 @@ This service wraps the MindIE WhisperX pipeline from ``example.py`` into an HTTP
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -19,6 +21,22 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from pipeline.pipeline import MindiePipeline, load_audio
+
+logger = logging.getLogger("ascend_whisperx_api")
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".flv",
+    ".wmv",
+    ".webm",
+    ".m4v",
+    ".mpeg",
+    ".mpg",
+    ".ts",
+    ".3gp",
+}
 
 
 @dataclass
@@ -59,6 +77,14 @@ class AscendWhisperXRuntime:
             config.batch_size,
             config.device_id,
         )
+        logger.info(
+            "runtime initialized: whisper_model_path=%s vad_model_path=%s compiled_models=%s batch_size=%s device_id=%s",
+            config.whisper_model_path,
+            config.vad_model_path,
+            config.compiled_models,
+            config.batch_size,
+            config.device_id,
+        )
 
         if config.open_warm_up:
             if not config.warm_up_audio_path:
@@ -71,29 +97,42 @@ class AscendWhisperXRuntime:
         batch_size: Optional[int] = None,
         filename: Optional[str] = None,
         language: Optional[str] = None,
+        content_type: Optional[str] = None,
     ) -> TranscribeResponse:
         if not os.path.isfile(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        speech_data = load_audio(audio_path)
+        total_start = time.perf_counter()
+        transcribe_path = audio_path
+        cleanup_paths: List[str] = []
+        source_name = filename or os.path.basename(audio_path)
+        if self._is_video_input(source_name, content_type):
+            transcribe_path = self._extract_audio_from_video(audio_path)
+            cleanup_paths.append(transcribe_path)
+
+        speech_data = load_audio(transcribe_path)
         used_batch_size = batch_size or self.config.batch_size
 
-        start = time.perf_counter()
-        with self._lock:
-            segments = self._pipeline.transcribe(
-                speech_data,
-                batch_size=used_batch_size,
-                language=language,
-            )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        try:
+            with self._lock:
+                segments = self._pipeline.transcribe(
+                    speech_data,
+                    batch_size=used_batch_size,
+                    language=language,
+                )
+            elapsed_ms = (time.perf_counter() - total_start) * 1000.0
 
-        return TranscribeResponse(
-            filename=filename or os.path.basename(audio_path),
-            language=language,
-            batch_size=used_batch_size,
-            elapsed_ms=round(elapsed_ms, 3),
-            segments=[Segment(**segment) for segment in segments],
-        )
+            return TranscribeResponse(
+                filename=source_name,
+                language=language,
+                batch_size=used_batch_size,
+                elapsed_ms=round(elapsed_ms, 3),
+                segments=[Segment(**segment) for segment in segments],
+            )
+        finally:
+            for path in cleanup_paths:
+                if os.path.exists(path):
+                    os.remove(path)
 
     def transcribe_bytes(
         self,
@@ -101,6 +140,7 @@ class AscendWhisperXRuntime:
         filename: str,
         batch_size: Optional[int] = None,
         language: Optional[str] = None,
+        content_type: Optional[str] = None,
     ) -> TranscribeResponse:
         suffix = Path(filename).suffix or ".wav"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
@@ -112,10 +152,53 @@ class AscendWhisperXRuntime:
                 batch_size=batch_size,
                 filename=filename,
                 language=language,
+                content_type=content_type,
             )
         finally:
             if os.path.exists(temp_audio_path):
                 os.remove(temp_audio_path)
+
+    @staticmethod
+    def _is_video_input(filename: str, content_type: Optional[str] = None) -> bool:
+        if content_type and content_type.lower().startswith("video/"):
+            return True
+        suffix = Path(filename).suffix.lower()
+        return suffix in VIDEO_EXTENSIONS
+
+    @staticmethod
+    def _extract_audio_from_video(video_path: str) -> str:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as audio_file:
+            audio_path = audio_file.name
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            video_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            audio_path,
+        ]
+        started = time.perf_counter()
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+            logger.info(
+                "video converted to audio: input=%s output=%s elapsed_ms=%.3f",
+                video_path,
+                audio_path,
+                (time.perf_counter() - started) * 1000.0,
+            )
+            return audio_path
+        except subprocess.CalledProcessError as exc:
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+            stderr = exc.stderr.decode(errors="ignore").strip()
+            raise RuntimeError(f"Failed to extract audio from video: {stderr}") from exc
 
 
 def create_app(runtime: AscendWhisperXRuntime) -> FastAPI:
@@ -144,25 +227,52 @@ def create_app(runtime: AscendWhisperXRuntime) -> FastAPI:
         used_bs = batch_size if batch_size is not None else bs
         if used_bs < 1:
             raise HTTPException(status_code=400, detail="bs must be greater than 0")
+        request_start = time.perf_counter()
         try:
+            logger.info(
+                "transcribe request: filename=%s content_type=%s language=%s batch_size=%s model=%s",
+                file.filename,
+                file.content_type,
+                language,
+                used_bs,
+                model,
+            )
             payload = await file.read()
             if not payload:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty")
             safe_filename = file.filename or "upload.wav"
-            _ = model
-            return runtime.transcribe_bytes(
+            response = runtime.transcribe_bytes(
                 payload,
                 safe_filename,
                 batch_size=used_bs,
                 language=language,
+                content_type=file.content_type,
             )
+            logger.info(
+                "transcribe done: filename=%s language=%s batch_size=%s transcribe_elapsed_ms=%.3f request_elapsed_ms=%.3f segments=%s",
+                response.filename,
+                response.language,
+                response.batch_size,
+                response.elapsed_ms,
+                (time.perf_counter() - request_start) * 1000.0,
+                len(response.segments),
+            )
+            return response
         except HTTPException:
+            logger.warning(
+                "transcribe http error: filename=%s request_elapsed_ms=%.3f",
+                file.filename,
+                (time.perf_counter() - request_start) * 1000.0,
+            )
             raise
         except ValueError as exc:
+            logger.warning("transcribe value error: %s", exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
+            logger.warning("transcribe file error: %s", exc)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - runtime depends on target env
+            logger.exception("transcribe failed")
             raise HTTPException(status_code=500, detail=f"Transcribe failed: {exc}") from exc
 
     return app
@@ -183,7 +293,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     args = parse_args()
+    logger.info(
+        "starting api service: host=%s port=%s batch_size=%s device_id=%s",
+        args.host,
+        args.port,
+        args.batch_size,
+        args.device_id,
+    )
 
     config = AscendWhisperXConfig(
         whisper_model_path=args.whisper_model_path,

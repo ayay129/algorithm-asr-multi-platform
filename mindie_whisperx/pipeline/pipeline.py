@@ -210,18 +210,21 @@ class MindiePipeline(Pipeline):
 
     def _sanitize_parameters(self, **kwargs):
         forward_params = {}
-        if "decoder_input_ids" in kwargs and kwargs["decoder_input_ids"] is not None:
-            forward_params["decoder_input_ids"] = kwargs["decoder_input_ids"]
+        if "forced_decoder_ids" in kwargs and kwargs["forced_decoder_ids"] is not None:
+            forward_params["forced_decoder_ids"] = kwargs["forced_decoder_ids"]
         return {}, forward_params, {}
 
-    def _build_decoder_prompt_ids(self, language: str):
+    def _build_forced_decoder_ids(self, language: str):
         language_code = language.lower()
         language_token = self.hf_tokenizer.token_to_id(f"<|{language_code}|>")
         if language_token is None:
             raise ValueError(
                 f"Unsupported language '{language}'. Please pass a Whisper language code such as zh/en/ja/de/fr."
             )
-        return [self.tokenizer.sot, language_token, self.tokenizer.transcribe]
+        return [
+            [1, language_token],
+            [2, self.tokenizer.transcribe],
+        ]
 
     def preprocess(self, audio):
         model_n_mels = 128
@@ -305,9 +308,7 @@ class MindiePipeline(Pipeline):
 
         infer_kwargs = {}
         if language:
-            decoder_prompt = self._build_decoder_prompt_ids(language)
-            decoder_input_ids = torch.tensor([decoder_prompt for _ in range(batch_size)], dtype=torch.long)
-            infer_kwargs["decoder_input_ids"] = decoder_input_ids
+            infer_kwargs["forced_decoder_ids"] = self._build_forced_decoder_ids(language)
 
         for idx, out in enumerate(
             self.__call__(

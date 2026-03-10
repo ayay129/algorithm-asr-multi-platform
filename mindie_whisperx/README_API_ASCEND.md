@@ -50,6 +50,14 @@ curl -X POST http://127.0.0.1:8000/v1/transcriptions \
   -F "bs=16"
 ```
 
+支持视频输入（例如 `mp4`、`mov`、`mkv`），服务会先抽取音频再转写：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/transcriptions \
+  -F "file=@/path/to/test.mp4" \
+  -F "language=zh"
+```
+
 也兼容常见路径：
 
 ```bash
@@ -67,8 +75,12 @@ curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
   -F "language=en"
 ```
 
+语言说明：
+- `language=zh` 只表示中文，不区分简体/繁体，输出可能为繁体或繁简混合。
+- 如果业务侧需要统一为简体中文，建议在转写结果后增加文本规范化（例如 OpenCC `t2s`）。
+
 返回字段：
-- `elapsed_ms`: 本次转写耗时（毫秒）
+- `elapsed_ms`: 本次端到端耗时（毫秒，包含视频转音频/音频解码/模型推理）
 - `language`: 本次指定的语言代码（未传则为 `null`，保持模型默认行为）
 - `batch_size`: 本次实际使用的 batch（`bs` 不传时默认 16）
 - `segments`: 与 `example.py` 同格式切片结果（`text/start/end`）
