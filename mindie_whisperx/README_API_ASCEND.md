@@ -117,6 +117,7 @@ bash mindie_whisperx/run_locust_benchmark.sh
 - `throughput_rps.png`: 吞吐与失败速率曲线。
 - `latency_ms.png`: 平均延迟与 P95 曲线。
 - `users_over_time.png`: 并发用户曲线。
+- `npu_utilization.png`: NPU Core 利用率曲线（启用采样时）。
 - `summary.png`: 总览柱状图。
 - `benchmark_summary.md`: 指标摘要。
 
@@ -163,3 +164,7 @@ python3 mindie_whisperx/plot_locust_results.py \
 - `LOCUST_RUN_TIME`: 压测时长（默认 `5m`）。
 - `OUT_ROOT`: 结果目录根路径（默认 `benchmarks`）。
 - `RUN_ID`: 压测输出目录名（默认时间戳）。
+- `NPU_MONITOR_ENABLE`: 是否启用 NPU 采样，默认 `1`。
+- `NPU_DEVICE_ID`: 采样的 NPU 设备编号，默认 `0`。
+- `NPU_POLL_INTERVAL_SECONDS`: 采样间隔秒数，默认 `1`。
+- `NPU_SMI_BIN`: `npu-smi` 可执行文件名，默认 `npu-smi`。
