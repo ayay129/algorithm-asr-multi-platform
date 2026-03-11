@@ -519,7 +519,6 @@ class MindieWhisperForConditionalGeneration(WhisperForConditionalGeneration, Gen
         kv_actual_step = 1
         indices = torch.tensor([0] * input_ids.shape[0]).to("npu")
         is_first_step = True
-        unfinished_sequences_repeat_num = 0
         while True:
             model_inputs = self.prepare_inputs_for_generation(input_ids, is_first_step, **model_kwargs)
             args = [model_inputs["decoder_input_ids"].contiguous().to("npu"), model_inputs["encoder_outputs"]]
@@ -565,12 +564,9 @@ class MindieWhisperForConditionalGeneration(WhisperForConditionalGeneration, Gen
                 # stop when each sentence is finished
                 if unfinished_sequences.max() == 0:
                     this_peer_finished = True
-                
-                if torch.sum(unfinished_sequences == 1).item() == 1:
-                    unfinished_sequences_repeat_num = unfinished_sequences_repeat_num + 1
 
             # stop if we exceed the maximum length
-            if stopping_criteria(input_ids, scores) or unfinished_sequences_repeat_num == MAX_REPEAT_NUM:
+            if stopping_criteria(input_ids, scores):
                 this_peer_finished = True
 
             if this_peer_finished:

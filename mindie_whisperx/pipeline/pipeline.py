@@ -302,9 +302,12 @@ class MindiePipeline(Pipeline):
             offset=self._vad_params.get("vad_offset", 0.363),
         )
         total_segments = len(vad_segments)
+        if total_segments == 0:
+            return []
 
+        infer_segments = list(vad_segments)
         if total_segments % batch_size != 0:
-            vad_segments = self.pad_segment(vad_segments, batch_size)
+            infer_segments = self.pad_segment(infer_segments, batch_size)
 
         infer_kwargs = {}
         if language:
@@ -312,20 +315,22 @@ class MindiePipeline(Pipeline):
 
         for idx, out in enumerate(
             self.__call__(
-                data(audio, vad_segments),
+                data(audio, infer_segments),
                 batch_size=batch_size,
                 num_workers=num_workers,
                 **infer_kwargs,
             )
         ):
+            if idx >= total_segments:
+                break
             text = out['text']
             if batch_size in [0, 1, None]:
                 text = text[0]
             segments.append(
                 {
                     "text": text,
-                    "start": round(vad_segments[idx]['start'], 3),
-                    "end": round(vad_segments[idx]['end'], 3)
+                    "start": round(infer_segments[idx]['start'], 3),
+                    "end": round(infer_segments[idx]['end'], 3)
                 }
             )
 

@@ -19,6 +19,8 @@ venv/
 # Runtime logs
 *.log
 logs/
+benchmarks/
+locust_result*
 
 # Model assets / compiled outputs
 compiled_models/

@@ -17,12 +17,14 @@ from pathlib import Path
 from threading import Lock
 from typing import List, Optional
 
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from pipeline.pipeline import MindiePipeline, load_audio
 
 logger = logging.getLogger("ascend_whisperx_api")
+SAMPLE_RATE = 16000
 VIDEO_EXTENSIONS = {
     ".mp4",
     ".mov",
@@ -46,6 +48,8 @@ class AscendWhisperXConfig:
     compiled_models: str
     batch_size: int
     device_id: int = 0
+    chunk_duration_seconds: int = 600
+    chunk_overlap_seconds: float = 1.0
     open_warm_up: bool = False
     warm_up_audio_path: Optional[str] = None
 
@@ -78,12 +82,14 @@ class AscendWhisperXRuntime:
             config.device_id,
         )
         logger.info(
-            "runtime initialized: whisper_model_path=%s vad_model_path=%s compiled_models=%s batch_size=%s device_id=%s",
+            "runtime initialized: whisper_model_path=%s vad_model_path=%s compiled_models=%s batch_size=%s device_id=%s chunk_duration_seconds=%s chunk_overlap_seconds=%s",
             config.whisper_model_path,
             config.vad_model_path,
             config.compiled_models,
             config.batch_size,
             config.device_id,
+            config.chunk_duration_seconds,
+            config.chunk_overlap_seconds,
         )
 
         if config.open_warm_up:
@@ -114,12 +120,11 @@ class AscendWhisperXRuntime:
         used_batch_size = batch_size or self.config.batch_size
 
         try:
-            with self._lock:
-                segments = self._pipeline.transcribe(
-                    speech_data,
-                    batch_size=used_batch_size,
-                    language=language,
-                )
+            segments = self._transcribe_waveform_with_chunking(
+                speech_data,
+                batch_size=used_batch_size,
+                language=language,
+            )
             elapsed_ms = (time.perf_counter() - total_start) * 1000.0
 
             return TranscribeResponse(
@@ -157,6 +162,105 @@ class AscendWhisperXRuntime:
         finally:
             if os.path.exists(temp_audio_path):
                 os.remove(temp_audio_path)
+
+    def _transcribe_waveform(
+        self,
+        audio_data: np.ndarray,
+        batch_size: int,
+        language: Optional[str],
+    ) -> List[dict]:
+        with self._lock:
+            return self._pipeline.transcribe(
+                audio_data,
+                batch_size=batch_size,
+                language=language,
+            )
+
+    def _transcribe_waveform_with_chunking(
+        self,
+        audio_data: np.ndarray,
+        batch_size: int,
+        language: Optional[str],
+    ) -> List[dict]:
+        chunk_seconds = self.config.chunk_duration_seconds
+        overlap_seconds = self.config.chunk_overlap_seconds
+        if chunk_seconds <= 0:
+            return self._transcribe_waveform(audio_data, batch_size, language)
+
+        chunk_samples = int(chunk_seconds * SAMPLE_RATE)
+        overlap_samples = int(max(0.0, overlap_seconds) * SAMPLE_RATE)
+        if chunk_samples <= 0:
+            return self._transcribe_waveform(audio_data, batch_size, language)
+
+        step_samples = chunk_samples - overlap_samples
+        if step_samples <= 0:
+            step_samples = chunk_samples
+
+        total_samples = int(audio_data.shape[0])
+        if total_samples <= chunk_samples:
+            return self._transcribe_waveform(audio_data, batch_size, language)
+
+        logger.info(
+            "long audio detected: duration_sec=%.3f chunk_sec=%s overlap_sec=%.3f",
+            total_samples / SAMPLE_RATE,
+            chunk_seconds,
+            overlap_seconds,
+        )
+        merged_segments: List[dict] = []
+        chunk_index = 0
+        for start in range(0, total_samples, step_samples):
+            end = min(total_samples, start + chunk_samples)
+            if start >= end:
+                break
+
+            chunk_audio = audio_data[start:end]
+            offset_sec = start / SAMPLE_RATE
+            chunk_segments = self._transcribe_waveform(chunk_audio, batch_size, language)
+            logger.info(
+                "chunk transcribed: index=%s start_sec=%.3f end_sec=%.3f segment_count=%s",
+                chunk_index,
+                offset_sec,
+                end / SAMPLE_RATE,
+                len(chunk_segments),
+            )
+            for segment in chunk_segments:
+                shifted = dict(segment)
+                shifted["start"] = round(float(shifted["start"]) + offset_sec, 3)
+                shifted["end"] = round(float(shifted["end"]) + offset_sec, 3)
+                merged_segments.append(shifted)
+            chunk_index += 1
+            if end >= total_samples:
+                break
+
+        return self._deduplicate_segments(merged_segments)
+
+    @staticmethod
+    def _deduplicate_segments(segments: List[dict]) -> List[dict]:
+        if not segments:
+            return []
+        ordered = sorted(
+            segments,
+            key=lambda seg: (float(seg.get("start", 0.0)), float(seg.get("end", 0.0))),
+        )
+        merged: List[dict] = []
+        for seg in ordered:
+            text = str(seg.get("text", "")).strip()
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start))
+            current = {"text": text, "start": round(start, 3), "end": round(end, 3)}
+            if not merged:
+                merged.append(current)
+                continue
+
+            prev = merged[-1]
+            same_text = prev["text"] == current["text"]
+            overlap = min(float(prev["end"]), end) - max(float(prev["start"]), start)
+            near_same_range = abs(float(prev["start"]) - start) <= 0.05 and abs(float(prev["end"]) - end) <= 0.05
+            if same_text and (near_same_range or overlap >= 0):
+                prev["end"] = round(max(float(prev["end"]), end), 3)
+                continue
+            merged.append(current)
+        return merged
 
     @staticmethod
     def _is_video_input(filename: str, content_type: Optional[str] = None) -> bool:
@@ -211,6 +315,8 @@ def create_app(runtime: AscendWhisperXRuntime) -> FastAPI:
             "backend": "ascend-mindie-whisperx",
             "device_id": runtime.config.device_id,
             "default_batch_size": runtime.config.batch_size,
+            "chunk_duration_seconds": runtime.config.chunk_duration_seconds,
+            "chunk_overlap_seconds": runtime.config.chunk_overlap_seconds,
         }
 
     @app.post("/", response_model=TranscribeResponse)
@@ -218,13 +324,17 @@ def create_app(runtime: AscendWhisperXRuntime) -> FastAPI:
     @app.post("/v1/audio/transcriptions", response_model=TranscribeResponse)
     async def transcribe_by_upload(
         file: UploadFile = File(...),
-        bs: int = Form(16),
+        bs: Optional[int] = Form(None),
         batch_size: Optional[int] = Form(None),
         language: Optional[str] = Form(None),
         model: Optional[str] = Form(None),
     ) -> TranscribeResponse:
         # keep compatibility with different clients: `bs` and `batch_size`
-        used_bs = batch_size if batch_size is not None else bs
+        used_bs = (
+            batch_size
+            if batch_size is not None
+            else (bs if bs is not None else runtime.config.batch_size)
+        )
         if used_bs < 1:
             raise HTTPException(status_code=400, detail="bs must be greater than 0")
         request_start = time.perf_counter()
@@ -285,6 +395,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compiled-models", default="compiled_models", help="Compiled models directory")
     parser.add_argument("--batch-size", type=int, default=16, help="Inference batch size, default: 16")
     parser.add_argument("--device-id", type=int, default=0, help="Ascend device id")
+    parser.add_argument(
+        "--chunk-duration-seconds",
+        type=int,
+        default=600,
+        help="Long audio chunk size in seconds; 0 means disable chunking, default: 600",
+    )
+    parser.add_argument(
+        "--chunk-overlap-seconds",
+        type=float,
+        default=1.0,
+        help="Chunk overlap in seconds for long audio, default: 1.0",
+    )
     parser.add_argument("--open-warm-up", action="store_true", help="Warm up once on startup")
     parser.add_argument("--warm-up-audio-path", default=None, help="Audio path used for warm up")
     parser.add_argument("--host", default="0.0.0.0", help="Server host")
@@ -299,11 +421,13 @@ def main() -> None:
     )
     args = parse_args()
     logger.info(
-        "starting api service: host=%s port=%s batch_size=%s device_id=%s",
+        "starting api service: host=%s port=%s batch_size=%s device_id=%s chunk_duration_seconds=%s chunk_overlap_seconds=%s",
         args.host,
         args.port,
         args.batch_size,
         args.device_id,
+        args.chunk_duration_seconds,
+        args.chunk_overlap_seconds,
     )
 
     config = AscendWhisperXConfig(
@@ -312,6 +436,8 @@ def main() -> None:
         compiled_models=args.compiled_models,
         batch_size=args.batch_size,
         device_id=args.device_id,
+        chunk_duration_seconds=args.chunk_duration_seconds,
+        chunk_overlap_seconds=args.chunk_overlap_seconds,
         open_warm_up=args.open_warm_up,
         warm_up_audio_path=args.warm_up_audio_path,
     )
