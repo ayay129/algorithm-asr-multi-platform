@@ -85,7 +85,8 @@ class AscendWhisperXUser(HttpUser):
     wait_time = between(min_wait, max_wait)
 
     media_dir = Path(os.getenv("AUDIO_DIR", "./test_media"))
-    endpoint = os.getenv("ASR_ENDPOINT", "/v1/audio/transcriptions")
+    #endpoint = os.getenv("ASR_ENDPOINT", "/v1/audio/transcriptions")
+    endpoint = os.getenv("ASR_ENDPOINT", "/")
     request_timeout = _env_float("ASR_REQUEST_TIMEOUT", 3600.0)
     request_model = os.getenv("ASR_MODEL", "").strip()
     request_language = os.getenv("ASR_LANGUAGE", "").strip()

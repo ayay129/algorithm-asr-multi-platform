@@ -14,6 +14,7 @@
 
 import os
 import subprocess
+import logging
 from functools import lru_cache
 from typing import Union, Optional
 import time
@@ -32,11 +33,50 @@ from whisper_large_v3.modeling_whisper import MindieWhisperForConditionalGenerat
 from .vad import load_vad_model, merge_chunks
 from .tokenizer import Tokenizer
 
+logger = logging.getLogger("mindie_whisperx.pipeline")
+
 
 def exact_div(x1, x2):
     if x1 % x2 != 0:
         raise ValueError("x1 is not divisible by x2")
     return x1 // x2
+
+
+def _env_int(name: str, default: int, min_value: int = 1) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("invalid %s=%s, fallback to %s", name, raw, default)
+        value = default
+    if value < min_value:
+        logger.warning("%s=%s is lower than %s, force to %s", name, value, min_value, min_value)
+        value = min_value
+    return value
+
+
+FFMPEG_THREADS = _env_int("ASR_FFMPEG_THREADS", 1, 1)
+TORCH_NUM_THREADS = _env_int("ASR_TORCH_NUM_THREADS", 1, 1)
+TORCH_INTEROP_THREADS = _env_int("ASR_TORCH_INTEROP_THREADS", 1, 1)
+_TORCH_THREAD_CONFIGURED = False
+
+
+def _configure_torch_cpu_threads() -> None:
+    global _TORCH_THREAD_CONFIGURED
+    if _TORCH_THREAD_CONFIGURED:
+        return
+    torch.set_num_threads(TORCH_NUM_THREADS)
+    try:
+        torch.set_num_interop_threads(TORCH_INTEROP_THREADS)
+    except RuntimeError:
+        # PyTorch only allows set_num_interop_threads once before work starts.
+        pass
+    logger.info(
+        "cpu threads configured: ASR_TORCH_NUM_THREADS=%s ASR_TORCH_INTEROP_THREADS=%s",
+        TORCH_NUM_THREADS,
+        TORCH_INTEROP_THREADS,
+    )
+    _TORCH_THREAD_CONFIGURED = True
 
 
 SAMPLE_RATE = 16000
@@ -74,7 +114,7 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
             "ffmpeg",
             "-nostdin",
             "-threads",
-            "0",
+            str(FFMPEG_THREADS),
             "-i",
             file,
             "-f",
@@ -162,6 +202,7 @@ def log_mel_spectrogram(
 
 class MindiePipeline(Pipeline):
     def __init__(self, whisper_model_path, vad_model_path, save_path, batch_size, deivce_id, **kwargs):
+        _configure_torch_cpu_threads()
         self.model = MindieWhisperForConditionalGeneration.from_pretrained(whisper_model_path).to("cpu")
         # 32g
         os.environ["TORCH_AIE_NPU_CACHE_MAX_SIZE"] = "32"

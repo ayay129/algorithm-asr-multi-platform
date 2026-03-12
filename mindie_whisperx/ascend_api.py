@@ -41,6 +41,22 @@ VIDEO_EXTENSIONS = {
 }
 
 
+def _env_int(name: str, default: int, min_value: int = 1) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("invalid %s=%s, fallback to %s", name, raw, default)
+        value = default
+    if value < min_value:
+        logger.warning("%s=%s is lower than %s, force to %s", name, value, min_value, min_value)
+        value = min_value
+    return value
+
+
+FFMPEG_THREADS = _env_int("ASR_FFMPEG_THREADS", 1, 1)
+
+
 @dataclass
 class AscendWhisperXConfig:
     whisper_model_path: str
@@ -276,6 +292,8 @@ class AscendWhisperXRuntime:
         cmd = [
             "ffmpeg",
             "-nostdin",
+            "-threads",
+            str(FFMPEG_THREADS),
             "-y",
             "-i",
             video_path,
@@ -421,13 +439,14 @@ def main() -> None:
     )
     args = parse_args()
     logger.info(
-        "starting api service: host=%s port=%s batch_size=%s device_id=%s chunk_duration_seconds=%s chunk_overlap_seconds=%s",
+        "starting api service: host=%s port=%s batch_size=%s device_id=%s chunk_duration_seconds=%s chunk_overlap_seconds=%s ASR_FFMPEG_THREADS=%s",
         args.host,
         args.port,
         args.batch_size,
         args.device_id,
         args.chunk_duration_seconds,
         args.chunk_overlap_seconds,
+        FFMPEG_THREADS,
     )
 
     config = AscendWhisperXConfig(

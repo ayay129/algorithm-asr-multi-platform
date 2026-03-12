@@ -4,7 +4,8 @@ Example:
   python3 mindie_whisperx/plot_locust_results.py \
     --csv-prefix benchmarks/20260310_120000/locust \
     --out-dir benchmarks/20260310_120000 \
-    --npu-log benchmarks/20260310_120000/npu_watch.log
+    --npu-log benchmarks/20260310_120000/npu_watch.log \
+    --service-log benchmarks/20260310_120000/service_watch.log
 """
 
 from __future__ import annotations
@@ -356,12 +357,99 @@ def _build_npu_summary(series: Dict[str, List[float]]) -> Dict[str, float]:
     }
 
 
+def _extract_service_series(service_log: Path) -> Optional[Dict[str, List[float]]]:
+    if not service_log.exists():
+        return None
+
+    lines = service_log.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not lines:
+        return None
+
+    x_labels: List[str] = []
+    cpu_pct: List[float] = []
+    rss_mb: List[float] = []
+
+    sample_lines: List[str] = []
+    sample_ts: Optional[int] = None
+
+    def flush_sample() -> None:
+        nonlocal sample_lines, sample_ts
+        if sample_ts is None:
+            sample_lines = []
+            return
+
+        found = False
+        cpu: Optional[float] = None
+        rss: Optional[float] = None
+        for line in sample_lines:
+            if line.startswith("SERVICE_FOUND"):
+                found = line.split()[-1] == "1"
+            elif line.startswith("SERVICE_CPU_PCT"):
+                cpu = _to_float(line.split()[-1])
+            elif line.startswith("SERVICE_RSS_MB"):
+                rss = _to_float(line.split()[-1])
+
+        if found and cpu is not None and rss is not None:
+            x_labels.append(_format_epoch_seconds(sample_ts))
+            cpu_pct.append(cpu)
+            rss_mb.append(rss)
+        sample_lines = []
+
+    for line in lines:
+        if line.startswith("### SAMPLE_START"):
+            flush_sample()
+            parts = line.split()
+            if parts:
+                try:
+                    sample_ts = int(parts[-1])
+                except ValueError:
+                    sample_ts = None
+            else:
+                sample_ts = None
+            continue
+
+        if line.startswith("### SAMPLE_END"):
+            flush_sample()
+            sample_ts = None
+            continue
+
+        if sample_ts is not None:
+            sample_lines.append(line)
+
+    flush_sample()
+
+    if not cpu_pct:
+        return None
+
+    return {
+        "x_labels": x_labels,
+        "cpu_pct": cpu_pct,
+        "rss_mb": rss_mb,
+    }
+
+
+def _build_service_summary(series: Dict[str, List[float]]) -> Dict[str, float]:
+    cpu = series["cpu_pct"]
+    rss = series["rss_mb"]
+    return {
+        "cpu_avg": sum(cpu) / len(cpu),
+        "cpu_p95": _percentile(cpu, 95),
+        "cpu_max": max(cpu),
+        "rss_avg": (sum(rss) / len(rss)) if rss else 0.0,
+        "rss_p95": _percentile(rss, 95) if rss else 0.0,
+        "rss_max": max(rss) if rss else 0.0,
+        "samples": float(len(cpu)),
+    }
+
+
 def _write_summary_markdown(
     summary: Dict[str, float],
     max_users: float,
     out_path: Path,
     csv_prefix: str,
     npu_summary: Optional[Dict[str, float]] = None,
+    service_summary: Optional[Dict[str, float]] = None,
+    service_monitor_note: Optional[str] = None,
 ) -> None:
     lines = [
         "# Benchmark Summary",
@@ -389,10 +477,37 @@ def _write_summary_markdown(
                 f"- npu_samples: `{npu_summary['samples']:.0f}`",
             ]
         )
+    if service_summary is not None:
+        lines.extend(
+            [
+                "",
+                "## Service Process Metrics",
+                f"- service_cpu_avg_pct: `{service_summary['cpu_avg']:.3f}`",
+                f"- service_cpu_p95_pct: `{service_summary['cpu_p95']:.3f}`",
+                f"- service_cpu_max_pct: `{service_summary['cpu_max']:.3f}`",
+                f"- service_rss_avg_mb: `{service_summary['rss_avg']:.3f}`",
+                f"- service_rss_p95_mb: `{service_summary['rss_p95']:.3f}`",
+                f"- service_rss_max_mb: `{service_summary['rss_max']:.3f}`",
+                f"- service_samples: `{service_summary['samples']:.0f}`",
+            ]
+        )
+    elif service_monitor_note:
+        lines.extend(
+            [
+                "",
+                "## Service Process Metrics",
+                f"- note: `{service_monitor_note}`",
+            ]
+        )
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def generate_charts(csv_prefix: Path, out_dir: Path, npu_log: Optional[Path] = None) -> List[Path]:
+def generate_charts(
+    csv_prefix: Path,
+    out_dir: Path,
+    npu_log: Optional[Path] = None,
+    service_log: Optional[Path] = None,
+) -> List[Path]:
     stats_file = csv_prefix.with_name(csv_prefix.name + "_stats.csv")
     history_file = csv_prefix.with_name(csv_prefix.name + "_stats_history.csv")
 
@@ -460,6 +575,40 @@ def generate_charts(csv_prefix: Path, out_dir: Path, npu_log: Optional[Path] = N
             outputs.append(npu_png)
             npu_summary = _build_npu_summary(npu_series)
 
+    service_summary = None
+    service_monitor_note = None
+    if service_log is not None:
+        if not service_log.exists():
+            service_monitor_note = f"service log not found: {service_log}"
+        else:
+            service_series = _extract_service_series(service_log)
+            if service_series is None:
+                service_monitor_note = (
+                    f"no valid service samples in {service_log}; "
+                    "check SERVICE_PID/SERVICE_MATCH and whether benchmark process can see service process"
+                )
+            else:
+                service_cpu_png = out_dir / "service_cpu_utilization.png"
+                _plot_timeseries(
+                    service_series["x_labels"],
+                    [("Service CPU Util(%)", service_series["cpu_pct"])],
+                    "Service CPU Utilization Over Time",
+                    "Utilization(%)",
+                    service_cpu_png,
+                )
+                outputs.append(service_cpu_png)
+
+                service_mem_png = out_dir / "service_memory_rss_mb.png"
+                _plot_timeseries(
+                    service_series["x_labels"],
+                    [("Service RSS(MB)", service_series["rss_mb"])],
+                    "Service RSS Memory Over Time",
+                    "RSS(MB)",
+                    service_mem_png,
+                )
+                outputs.append(service_mem_png)
+                service_summary = _build_service_summary(service_series)
+
     summary_md = out_dir / "benchmark_summary.md"
     _write_summary_markdown(
         summary,
@@ -467,6 +616,8 @@ def generate_charts(csv_prefix: Path, out_dir: Path, npu_log: Optional[Path] = N
         summary_md,
         str(csv_prefix),
         npu_summary=npu_summary,
+        service_summary=service_summary,
+        service_monitor_note=service_monitor_note,
     )
     outputs.append(summary_md)
 
@@ -486,6 +637,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional npu-smi watch log file for utilization stats",
     )
+    parser.add_argument(
+        "--service-log",
+        default=None,
+        help="Optional process watch log file for service CPU/RSS stats",
+    )
     return parser.parse_args()
 
 
@@ -494,7 +650,13 @@ def main() -> None:
     csv_prefix = Path(args.csv_prefix)
     out_dir = Path(args.out_dir) if args.out_dir else csv_prefix.parent
     npu_log = Path(args.npu_log) if args.npu_log else None
-    outputs = generate_charts(csv_prefix, out_dir, npu_log=npu_log)
+    service_log = Path(args.service_log) if args.service_log else None
+    outputs = generate_charts(
+        csv_prefix,
+        out_dir,
+        npu_log=npu_log,
+        service_log=service_log,
+    )
     print("Generated:")
     for path in outputs:
         print(path)
