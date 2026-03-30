@@ -199,6 +199,7 @@ class WhisperXRuntime:
         cleanup_paths: List[str] = []
         audio = None
         result = None
+        detected_language = language or self.config.language
         align_model = None
         align_metadata = None
         diarize_pipeline = None
@@ -216,9 +217,12 @@ class WhisperXRuntime:
                     language=language,
                     task=task or self.config.task,
                 )
+                detected_language = result.get("language") or detected_language
 
                 if effective_align and result.get("segments"):
-                    align_model, align_metadata = self._load_align_model(result["language"])
+                    if not detected_language:
+                        raise RuntimeError("alignment requested but language is unavailable")
+                    align_model, align_metadata = self._load_align_model(detected_language)
                     try:
                         result = self._whisperx.align(
                             result["segments"],
@@ -243,7 +247,7 @@ class WhisperXRuntime:
                     result = self._whisperx.assign_word_speakers(diarize_segments, result)
 
             return TranscribeResponse(
-                language=result.get("language"),
+                language=detected_language,
                 segments=self._serialize_segments(result.get("segments", [])),
             )
         finally:
@@ -371,6 +375,11 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _enable_offline_model_loading() -> None:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
 def create_app(runtime: WhisperXRuntime) -> FastAPI:
     app = FastAPI(title="WhisperX NVIDIA API", version="0.1.0")
 
@@ -494,6 +503,8 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     args = parse_args()
+    if args.local_files_only:
+        _enable_offline_model_loading()
     config = WhisperXConfig(
         model_name=args.model,
         device=args.device,
