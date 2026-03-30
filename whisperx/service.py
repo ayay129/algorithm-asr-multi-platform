@@ -137,6 +137,45 @@ def create_diarization_pipeline(
         return pipeline_cls(token=None, **kwargs)
 
 
+def _is_model_repo_dir(path: Path) -> bool:
+    return path.is_dir() and ((path / "config.yaml").exists() or (path / "config.json").exists())
+
+
+def _resolve_snapshot_repo_dir(path: Path) -> Optional[Path]:
+    if _is_model_repo_dir(path):
+        return path
+    snapshots_dir = path / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+    for snapshot in sorted(snapshots_dir.iterdir()):
+        if _is_model_repo_dir(snapshot):
+            return snapshot
+    return None
+
+
+def resolve_local_diarize_model_path(model_name: str, download_root: Optional[str]) -> Optional[str]:
+    direct_path = Path(model_name)
+    if _is_model_repo_dir(direct_path):
+        return str(direct_path.resolve())
+
+    if not download_root:
+        return None
+
+    search_roots = [Path(download_root), Path(download_root) / "hub"]
+    candidate_names = {direct_path.name}
+    if "/" in model_name:
+        owner, repo = model_name.split("/", 1)
+        candidate_names.add(repo)
+        candidate_names.add(f"models--{owner}--{repo}")
+
+    for search_root in search_roots:
+        for candidate_name in candidate_names:
+            resolved = _resolve_snapshot_repo_dir(search_root / candidate_name)
+            if resolved is not None:
+                return str(resolved.resolve())
+    return None
+
+
 class WhisperXRuntime:
     def __init__(self, config: WhisperXConfig) -> None:
         self.config = config
@@ -180,25 +219,27 @@ class WhisperXRuntime:
         )
 
     def _create_diarize_pipeline(self):
-        diarize_model_path = Path(self.config.diarize_model)
-        use_local_diarize_model = diarize_model_path.exists()
-        if not self.config.hf_token and not use_local_diarize_model:
+        resolved_local_diarize_model = resolve_local_diarize_model_path(
+            self.config.diarize_model,
+            self.config.download_root,
+        )
+        if not self.config.hf_token and not resolved_local_diarize_model:
             raise RuntimeError(
-                "diarization requires --hf-token/HF_TOKEN, or set --diarize-model to a local directory"
+                "diarization requires --hf-token/HF_TOKEN, or local pyannote files under download_root"
             )
         LOGGER.info(
             "loading diarization pipeline: model=%s cache_mode=%s",
-            self.config.diarize_model,
+            resolved_local_diarize_model or self.config.diarize_model,
             self.config.diarize_cache_mode,
         )
         if self._diarization_pipeline_class is None:
             self._diarization_pipeline_class = load_diarization_pipeline_class()
         return create_diarization_pipeline(
             self._diarization_pipeline_class,
-            model_name=self.config.diarize_model,
+            model_name=resolved_local_diarize_model or self.config.diarize_model,
             hf_token=self.config.hf_token,
             device=self.config.device,
-            cache_dir=None if use_local_diarize_model else self.config.download_root,
+            cache_dir=None if resolved_local_diarize_model else self.config.download_root,
         )
 
     def _get_diarize_pipeline(self):

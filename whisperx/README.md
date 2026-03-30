@@ -17,27 +17,6 @@ pip install -r requirements.txt
 export HF_TOKEN=your_token
 ```
 
-## 预下载模型到固定目录
-
-先把所有运行时需要的模型下载到固定目录，例如 `/models/whisperx`：
-
-```bash
-cd /Users/rangers/DevelopServices/app/algo-asr-multi-plat/whisperx
-source .venv/bin/activate
-python3 download_models.py \
-  --model large-v3 \
-  --download-root /models/whisperx \
-  --languages zh,en,fr,ar \
-  --include-diarization \
-  --hf-token "$HF_TOKEN"
-```
-
-说明：
-
-- `download_models.py` 会把 ASR、对齐模型、可选 diarization 模型都下载到 `--download-root`
-- 服务启动时配合 `--download-root /models/whisperx --local-files-only`，运行期不会再临时联网下载
-- 如果你只测中文，可以把 `--languages` 改成 `zh`
-
 ## 启动
 
 ```bash
@@ -78,7 +57,8 @@ DOCKER_BUILDKIT=1 docker build \
 说明：
 
 - `whisperx_src` 必须指向你宿主机上已经下载好的原生 WhisperX 源码目录，Docker 构建阶段不会再去 GitHub 拉代码
-- `whisperx_models` 必须指向你宿主机上已经下载好的模型目录，Docker 构建阶段会直接复制进镜像内 `/models/whisperx`
+- `whisperx_models` 必须指向你宿主机上已经下载好的模型目录，Docker 构建阶段会把整个目录直接复制进镜像内 `/models/whisperx`
+- 也就是说，只要服务器上的 `/root/whisperx-model` 里已经有 `large-v3` 和 `pyannote` 的 diarize 模型，构建出来的镜像就是离线可运行的
 - 构建过程不需要容器内访问 GitHub，也不需要在构建阶段再传 `HF_TOKEN`
 - 如果你只做中文，`whisperx_models` 里保留中文所需模型即可
 
@@ -92,6 +72,16 @@ docker run --rm -it \
 ```
 
 如果你已经在 build 阶段把模型打进镜像，运行时不需要再传 `HF_TOKEN`，也不需要再挂载模型目录。
+
+服务器上的推荐构建命令：
+
+```bash
+cd /root/algorithm-asr-multi-platform/whisperx
+DOCKER_BUILDKIT=1 docker build \
+  --build-context whisperx_src=/root/whisperX \
+  --build-context whisperx_models=/root/whisperx-model \
+  -t whisperx-nvidia:offline-zh .
+```
 
 自定义启动参数：
 
