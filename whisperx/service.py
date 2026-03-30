@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -55,6 +56,10 @@ def _env_int(name: str, default: int) -> int:
 
 
 FFMPEG_THREADS = _env_int("ASR_FFMPEG_THREADS", 1)
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000.0, 2)
 
 
 @dataclass
@@ -261,6 +266,7 @@ class WhisperXRuntime:
         self,
         path: str,
         *,
+        request_id: Optional[str] = None,
         filename: Optional[str] = None,
         batch_size: Optional[int] = None,
         language: Optional[str] = None,
@@ -275,6 +281,7 @@ class WhisperXRuntime:
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
 
+        request_id = request_id or uuid.uuid4().hex[:8]
         source_name = filename or os.path.basename(path)
         effective_align = self.config.default_align if align is None else align
         effective_diarize = self.config.default_diarize if diarize is None else diarize
@@ -284,6 +291,18 @@ class WhisperXRuntime:
             effective_align = True
 
         started = time.perf_counter()
+        status = "ok"
+        LOGGER.info(
+            "request=%s transcribe start filename=%s content_type=%s task=%s language=%s batch_size=%s align=%s diarize=%s",
+            request_id,
+            source_name,
+            content_type,
+            task or self.config.task,
+            language or self.config.language,
+            batch_size or self.config.batch_size,
+            effective_align,
+            effective_diarize,
+        )
         audio_path = path
         cleanup_paths: List[str] = []
         audio = None
@@ -294,12 +313,33 @@ class WhisperXRuntime:
         diarize_pipeline = None
         diarize_segments = None
         if self._is_video_input(source_name, content_type):
+            extract_started = time.perf_counter()
             audio_path = self._extract_audio_from_video(path)
             cleanup_paths.append(audio_path)
+            LOGGER.info(
+                "request=%s stage=extract_audio duration_ms=%.2f output=%s",
+                request_id,
+                _elapsed_ms(extract_started),
+                audio_path,
+            )
 
         try:
+            load_audio_started = time.perf_counter()
             audio = self._whisperx.load_audio(audio_path)
+            LOGGER.info(
+                "request=%s stage=load_audio duration_ms=%.2f sample_count=%s",
+                request_id,
+                _elapsed_ms(load_audio_started),
+                len(audio) if hasattr(audio, "__len__") else "unknown",
+            )
+            lock_wait_started = time.perf_counter()
             with self._lock:
+                LOGGER.info(
+                    "request=%s stage=model_lock_acquired wait_ms=%.2f",
+                    request_id,
+                    _elapsed_ms(lock_wait_started),
+                )
+                asr_started = time.perf_counter()
                 result = self._asr_model.transcribe(
                     audio,
                     batch_size=batch_size or self.config.batch_size,
@@ -307,12 +347,27 @@ class WhisperXRuntime:
                     task=task or self.config.task,
                 )
                 detected_language = result.get("language") or detected_language
+                LOGGER.info(
+                    "request=%s stage=asr duration_ms=%.2f detected_language=%s segments=%s",
+                    request_id,
+                    _elapsed_ms(asr_started),
+                    detected_language,
+                    len(result.get("segments", [])),
+                )
 
                 if effective_align and result.get("segments"):
                     if not detected_language:
                         raise RuntimeError("alignment requested but language is unavailable")
+                    align_load_started = time.perf_counter()
                     align_model, align_metadata = self._load_align_model(detected_language)
+                    LOGGER.info(
+                        "request=%s stage=align_model_load duration_ms=%.2f language=%s",
+                        request_id,
+                        _elapsed_ms(align_load_started),
+                        detected_language,
+                    )
                     try:
+                        align_started = time.perf_counter()
                         result = self._whisperx.align(
                             result["segments"],
                             align_model,
@@ -321,24 +376,60 @@ class WhisperXRuntime:
                             self.config.device,
                             return_char_alignments=return_char_alignments,
                         )
+                        LOGGER.info(
+                            "request=%s stage=align duration_ms=%.2f aligned_segments=%s",
+                            request_id,
+                            _elapsed_ms(align_started),
+                            len(result.get("segments", [])),
+                        )
                     finally:
                         self._release_torch_objects(align_model, align_metadata)
                         align_model = None
                         align_metadata = None
 
                 if effective_diarize:
+                    diarize_load_started = time.perf_counter()
                     diarize_pipeline = self._get_diarize_pipeline()
+                    LOGGER.info(
+                        "request=%s stage=diarize_model_load duration_ms=%.2f",
+                        request_id,
+                        _elapsed_ms(diarize_load_started),
+                    )
+                    diarize_started = time.perf_counter()
                     diarize_segments = diarize_pipeline(
                         audio_path,
                         min_speakers=min_speakers,
                         max_speakers=max_speakers,
                     )
+                    LOGGER.info(
+                        "request=%s stage=diarize duration_ms=%.2f diarize_segments=%s",
+                        request_id,
+                        _elapsed_ms(diarize_started),
+                        len(diarize_segments) if hasattr(diarize_segments, "__len__") else "unknown",
+                    )
+                    assign_started = time.perf_counter()
                     result = self._whisperx.assign_word_speakers(diarize_segments, result)
+                    LOGGER.info(
+                        "request=%s stage=assign_speakers duration_ms=%.2f",
+                        request_id,
+                        _elapsed_ms(assign_started),
+                    )
 
+            serialize_started = time.perf_counter()
+            segments = self._serialize_segments(result.get("segments", []))
+            LOGGER.info(
+                "request=%s stage=serialize duration_ms=%.2f segments=%s",
+                request_id,
+                _elapsed_ms(serialize_started),
+                len(segments),
+            )
             return TranscribeResponse(
                 language=detected_language,
-                segments=self._serialize_segments(result.get("segments", [])),
+                segments=segments,
             )
+        except Exception:
+            status = "error"
+            raise
         finally:
             self._release_diarize_pipeline(diarize_pipeline)
             audio = None
@@ -347,11 +438,20 @@ class WhisperXRuntime:
             diarize_pipeline = None
             for item in cleanup_paths:
                 Path(item).unlink(missing_ok=True)
+            LOGGER.info(
+                "request=%s transcribe finished status=%s total_ms=%.2f detected_language=%s cleanup_paths=%s",
+                request_id,
+                status,
+                _elapsed_ms(started),
+                detected_language,
+                len(cleanup_paths),
+            )
 
     def transcribe_bytes(
         self,
         payload: bytes,
         *,
+        request_id: Optional[str] = None,
         filename: str,
         batch_size: Optional[int] = None,
         language: Optional[str] = None,
@@ -370,6 +470,7 @@ class WhisperXRuntime:
         try:
             return self.transcribe_file(
                 temp_path,
+                request_id=request_id,
                 filename=filename,
                 batch_size=batch_size,
                 language=language,
@@ -500,16 +601,39 @@ def create_app(runtime: WhisperXRuntime) -> FastAPI:
         max_speakers: Optional[int] = Form(None),
         return_char_alignments: bool = Form(False),
     ) -> TranscribeResponse:
+        request_id = uuid.uuid4().hex[:8]
+        request_started = time.perf_counter()
         used_batch_size = batch_size if batch_size is not None else bs
         if not file.filename:
             file.filename = "upload.wav"
         temp_upload_path = None
+        LOGGER.info(
+            "request=%s api_request_start filename=%s content_type=%s batch_size=%s language=%s task=%s align=%s diarize=%s",
+            request_id,
+            file.filename,
+            file.content_type,
+            used_batch_size or runtime.config.batch_size,
+            language or runtime.config.language,
+            task or runtime.config.task,
+            align,
+            diarize,
+        )
         try:
+            persist_started = time.perf_counter()
             temp_upload_path = await _persist_upload_to_tempfile(file)
             if not temp_upload_path:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty")
-            return runtime.transcribe_file(
+            LOGGER.info(
+                "request=%s stage=upload_persist duration_ms=%.2f file_size_bytes=%s temp_path=%s",
+                request_id,
+                _elapsed_ms(persist_started),
+                os.path.getsize(temp_upload_path),
                 temp_upload_path,
+            )
+            pipeline_started = time.perf_counter()
+            response = runtime.transcribe_file(
+                temp_upload_path,
+                request_id=request_id,
                 filename=file.filename or "upload.wav",
                 batch_size=used_batch_size,
                 language=language,
@@ -521,17 +645,30 @@ def create_app(runtime: WhisperXRuntime) -> FastAPI:
                 return_char_alignments=return_char_alignments,
                 content_type=file.content_type,
             )
+            LOGGER.info(
+                "request=%s stage=runtime_pipeline duration_ms=%.2f response_segments=%s response_language=%s",
+                request_id,
+                _elapsed_ms(pipeline_started),
+                len(response.segments),
+                response.language,
+            )
+            return response
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            LOGGER.exception("transcribe failed")
+            LOGGER.exception("request=%s transcribe failed", request_id)
             raise HTTPException(status_code=500, detail=f"Transcribe failed: {exc}") from exc
         finally:
             if temp_upload_path:
                 Path(temp_upload_path).unlink(missing_ok=True)
             await file.close()
+            LOGGER.info(
+                "request=%s api_request_finished total_ms=%.2f",
+                request_id,
+                _elapsed_ms(request_started),
+            )
 
     return app
 
