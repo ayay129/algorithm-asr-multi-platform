@@ -1,0 +1,17 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.tmp
+*.log
+*.pt
+*.bin
+*.ckpt
+*.safetensors
+models
+cache
+README_API_ASCEND.md
