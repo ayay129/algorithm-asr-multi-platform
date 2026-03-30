@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import logging
 import os
 from pathlib import Path
@@ -48,6 +49,39 @@ def release(*objects) -> None:
         pass
 
 
+def load_diarization_pipeline_class():
+    try:
+        diarize_module = importlib.import_module("whisperx.diarize")
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import whisperx diarization module. "
+            "Ensure the installed whisperx package includes diarization support."
+        ) from exc
+    pipeline_cls = getattr(diarize_module, "DiarizationPipeline", None)
+    if pipeline_cls is None:
+        raise RuntimeError("Installed whisperx package does not expose whisperx.diarize.DiarizationPipeline")
+    return pipeline_cls
+
+
+def create_diarization_pipeline(
+    pipeline_cls,
+    *,
+    model_name: str,
+    hf_token: str,
+    device: str,
+    cache_dir: str,
+):
+    kwargs = {
+        "model_name": model_name,
+        "device": device,
+        "cache_dir": cache_dir,
+    }
+    try:
+        return pipeline_cls(token=hf_token, **kwargs)
+    except TypeError:
+        return pipeline_cls(use_auth_token=hf_token, **kwargs)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -88,9 +122,11 @@ def main() -> None:
         if not args.hf_token:
             raise RuntimeError("--include-diarization requires --hf-token or HF_TOKEN")
         LOGGER.info("preloading diarization model=%s", args.diarize_model)
-        diarize_pipeline = whisperx.DiarizationPipeline(
+        diarization_pipeline_class = load_diarization_pipeline_class()
+        diarize_pipeline = create_diarization_pipeline(
+            diarization_pipeline_class,
             model_name=args.diarize_model,
-            use_auth_token=args.hf_token,
+            hf_token=args.hf_token,
             device=args.device,
             cache_dir=str(download_root),
         )

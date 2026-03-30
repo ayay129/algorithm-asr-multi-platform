@@ -7,13 +7,14 @@ This service is intentionally small and follows the upstream WhisperX Python API
 - model.transcribe(...)
 - whisperx.load_align_model(...)
 - whisperx.align(...)
-- whisperx.DiarizationPipeline(...)
+- whisperx.diarize.DiarizationPipeline(...)
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import logging
 import os
 import subprocess
@@ -98,11 +99,45 @@ def load_whisperx_module():
     return whisperx
 
 
+def load_diarization_pipeline_class():
+    try:
+        diarize_module = importlib.import_module("whisperx.diarize")
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import whisperx diarization module. "
+            "Ensure the installed whisperx package includes diarization support."
+        ) from exc
+    pipeline_cls = getattr(diarize_module, "DiarizationPipeline", None)
+    if pipeline_cls is None:
+        raise RuntimeError("Installed whisperx package does not expose whisperx.diarize.DiarizationPipeline")
+    return pipeline_cls
+
+
+def create_diarization_pipeline(
+    pipeline_cls,
+    *,
+    model_name: str,
+    hf_token: str,
+    device: str,
+    cache_dir: Optional[str],
+):
+    kwargs = {
+        "model_name": model_name,
+        "device": device,
+        "cache_dir": cache_dir,
+    }
+    try:
+        return pipeline_cls(token=hf_token, **kwargs)
+    except TypeError:
+        return pipeline_cls(use_auth_token=hf_token, **kwargs)
+
+
 class WhisperXRuntime:
     def __init__(self, config: WhisperXConfig) -> None:
         self.config = config
         self._lock = threading.Lock()
         self._whisperx = load_whisperx_module()
+        self._diarization_pipeline_class = None
         self._asr_model = self._load_asr_model()
         self._diarize_pipeline = None
 
@@ -147,9 +182,12 @@ class WhisperXRuntime:
             self.config.diarize_model,
             self.config.diarize_cache_mode,
         )
-        return self._whisperx.DiarizationPipeline(
+        if self._diarization_pipeline_class is None:
+            self._diarization_pipeline_class = load_diarization_pipeline_class()
+        return create_diarization_pipeline(
+            self._diarization_pipeline_class,
             model_name=self.config.diarize_model,
-            use_auth_token=self.config.hf_token,
+            hf_token=self.config.hf_token,
             device=self.config.device,
             cache_dir=self.config.download_root,
         )
