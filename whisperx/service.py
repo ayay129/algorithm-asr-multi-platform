@@ -166,6 +166,7 @@ def resolve_local_diarize_model_path(model_name: str, download_root: Optional[st
     if "/" in model_name:
         owner, repo = model_name.split("/", 1)
         candidate_names.add(repo)
+        candidate_names.add(f"{owner}-{repo}")
         candidate_names.add(f"models--{owner}--{repo}")
 
     for search_root in search_roots:

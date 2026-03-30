@@ -46,4 +46,4 @@ COPY README.md /app/README.md
 
 EXPOSE 8000
 
-CMD ["python3", "/app/service.py", "--model", "large-v3", "--device", "cuda", "--device-index", "0", "--compute-type", "float16", "--batch-size", "16", "--download-root", "/models/whisperx", "--local-files-only", "--diarize-model", "pyannote/speaker-diarization-community-1", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "/app/service.py", "--model", "large-v3", "--device", "cuda", "--device-index", "0", "--compute-type", "float16", "--batch-size", "16", "--download-root", "/models/whisperx", "--local-files-only", "--diarize-model", "pyannote/speaker-diarization-community-1", "--default-diarize", "--host", "0.0.0.0", "--port", "8000"]

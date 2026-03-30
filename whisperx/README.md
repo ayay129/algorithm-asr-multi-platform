@@ -72,6 +72,7 @@ docker run --rm -it \
 ```
 
 如果你已经在 build 阶段把模型打进镜像，运行时不需要再传 `HF_TOKEN`，也不需要再挂载模型目录。
+默认已经开启离线加载和 speaker diarization。
 
 服务器上的推荐构建命令：
 
@@ -83,25 +84,14 @@ DOCKER_BUILDKIT=1 docker build \
   -t whisperx-nvidia:offline-zh .
 ```
 
-自定义启动参数：
+服务器上的推荐启动命令：
 
 ```bash
-docker run --rm -it \
-  --gpus all \
+docker run -d \
+  --name whisperx \
+  --gpus '"device=0"' \
   -p 8000:8000 \
-  -v /data/whisperx-models:/models/whisperx \
-  -v /data/whisperx-cache:/models/.cache \
-  whisperx-nvidia:latest \
-  python3 /app/service.py \
-  --model large-v3 \
-  --device cuda \
-  --device-index 0 \
-  --compute-type float16 \
-  --batch-size 8 \
-  --download-root /models/whisperx \
-  --local-files-only \
-  --diarize-cache-mode offload \
-  --disable-default-align
+  whisperx-nvidia:offline-zh
 ```
 
 ## 调用
@@ -110,7 +100,6 @@ docker run --rm -it \
 curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
   -F "file=@/path/to/audio.wav" \
   -F "language=zh" \
-  -F "diarize=true" \
   -F "batch_size=16"
 ```
 
@@ -152,4 +141,4 @@ curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
 - 每个 segment 只返回 `text`、`start`、`end`
 - 如果启用了 diarization 且识别到了 speaker，返回文本会拼成 `SPEAKER_00 ||  文本`
 - 如果没有 speaker 信息，`text` 就是纯转写文本
-- 只传 `language=zh` 不会自动出 `speaker`，还需要 `diarize=true`，并且容器里要提前准备好 diarization 模型和 `HF_TOKEN`
+- 这版离线镜像默认已经启用 diarization，所以通常不需要再传 `diarize=true`
