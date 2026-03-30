@@ -71,33 +71,16 @@ python3 service.py \
 cd /Users/rangers/DevelopServices/app/algo-asr-multi-plat/whisperx
 DOCKER_BUILDKIT=1 docker build \
   --build-context whisperx_src=/path/to/local/whisperX \
-  -t whisperx-nvidia:latest .
-```
-
-构建时把模型直接打进镜像：
-
-```bash
-cd /Users/rangers/DevelopServices/app/algo-asr-multi-plat/whisperx
-printf '%s' 'your_hf_token' > /tmp/hf_token.txt
-DOCKER_BUILDKIT=1 docker build \
-  --build-context whisperx_src=/path/to/local/whisperX \
-  --secret id=hf_token,src=/tmp/hf_token.txt \
-  --build-arg PRELOAD_MODELS=1 \
-  --build-arg PRELOAD_MODEL_NAME=large-v3 \
-  --build-arg PRELOAD_LANGUAGES=zh \
-  --build-arg INCLUDE_DIARIZATION=1 \
-  --build-arg DIARIZE_MODEL_REPO=pyannote/speaker-diarization-community-1 \
+  --build-context whisperx_models=/path/to/local/whisperx-models \
   -t whisperx-nvidia:offline-zh .
-rm -f /tmp/hf_token.txt
 ```
 
 说明：
 
 - `whisperx_src` 必须指向你宿主机上已经下载好的原生 WhisperX 源码目录，Docker 构建阶段不会再去 GitHub 拉代码
-- 这会在 `docker build` 阶段把 ASR、中文对齐模型、speaker diarization 模型直接下载进镜像内 `/models/whisperx`
-- 运行容器时不需要再传 `HF_TOKEN`
-- 需要先在 Hugging Face 上接受 `pyannote/speaker-diarization-community-1` 的访问条款
-- 推荐用 BuildKit secret 传 token，避免把 token 写进镜像历史
+- `whisperx_models` 必须指向你宿主机上已经下载好的模型目录，Docker 构建阶段会直接复制进镜像内 `/models/whisperx`
+- 构建过程不需要容器内访问 GitHub，也不需要在构建阶段再传 `HF_TOKEN`
+- 如果你只做中文，`whisperx_models` 里保留中文所需模型即可
 
 运行容器：
 
@@ -105,41 +88,10 @@ rm -f /tmp/hf_token.txt
 docker run --rm -it \
   --gpus all \
   -p 8000:8000 \
-  -v /data/whisperx-models:/models/whisperx \
-  -v /data/whisperx-cache:/models/.cache \
-  whisperx-nvidia:latest
-```
-
-如果你已经在 build 阶段把模型打进镜像，运行时不需要 `HF_TOKEN`。
-
-先用容器把模型下载到固定目录：
-
-```bash
-docker run --rm -it \
-  --gpus all \
-  -e HF_TOKEN=your_token \
-  -v /data/whisperx-models:/models/whisperx \
-  -v /data/whisperx-cache:/models/.cache \
-  whisperx-nvidia:latest \
-  python3 /app/download_models.py \
-  --model large-v3 \
-  --download-root /models/whisperx \
-  --device cuda \
-  --compute-type float16 \
-  --languages zh,en,fr,ar \
-  --include-diarization
-```
-
-然后再启动服务。这样模型目录固定在容器内 `/models/whisperx`，宿主机实际落盘在 `/data/whisperx-models`，服务运行时不会再临时下载。
-
-如果你是“模型直接打进镜像”的方案，可以直接运行，不需要再挂载模型目录：
-
-```bash
-docker run --rm -it \
-  --gpus all \
-  -p 8000:8000 \
   whisperx-nvidia:offline-zh
 ```
+
+如果你已经在 build 阶段把模型打进镜像，运行时不需要再传 `HF_TOKEN`，也不需要再挂载模型目录。
 
 自定义启动参数：
 
