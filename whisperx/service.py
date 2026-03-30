@@ -117,7 +117,7 @@ def create_diarization_pipeline(
     pipeline_cls,
     *,
     model_name: str,
-    hf_token: str,
+    hf_token: Optional[str],
     device: str,
     cache_dir: Optional[str],
 ):
@@ -126,10 +126,15 @@ def create_diarization_pipeline(
         "device": device,
         "cache_dir": cache_dir,
     }
+    if hf_token:
+        try:
+            return pipeline_cls(token=hf_token, **kwargs)
+        except TypeError:
+            return pipeline_cls(use_auth_token=hf_token, **kwargs)
     try:
-        return pipeline_cls(token=hf_token, **kwargs)
+        return pipeline_cls(**kwargs)
     except TypeError:
-        return pipeline_cls(use_auth_token=hf_token, **kwargs)
+        return pipeline_cls(token=None, **kwargs)
 
 
 class WhisperXRuntime:
@@ -175,8 +180,12 @@ class WhisperXRuntime:
         )
 
     def _create_diarize_pipeline(self):
-        if not self.config.hf_token:
-            raise RuntimeError("diarization requires --hf-token or HF_TOKEN")
+        diarize_model_path = Path(self.config.diarize_model)
+        use_local_diarize_model = diarize_model_path.exists()
+        if not self.config.hf_token and not use_local_diarize_model:
+            raise RuntimeError(
+                "diarization requires --hf-token/HF_TOKEN, or set --diarize-model to a local directory"
+            )
         LOGGER.info(
             "loading diarization pipeline: model=%s cache_mode=%s",
             self.config.diarize_model,
@@ -189,7 +198,7 @@ class WhisperXRuntime:
             model_name=self.config.diarize_model,
             hf_token=self.config.hf_token,
             device=self.config.device,
-            cache_dir=self.config.download_root,
+            cache_dir=None if use_local_diarize_model else self.config.download_root,
         )
 
     def _get_diarize_pipeline(self):
