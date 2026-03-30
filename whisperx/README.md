@@ -100,14 +100,29 @@ curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
 
 ## 返回
 
-返回值包含：
+返回值格式：
 
-- 文件名
-- 模型名
-- 任务类型
-- 语言
-- 耗时
-- 是否对齐
-- 是否做了说话人分离
-- 逐段转写结果
-- 逐词时间戳和说话人信息
+```json
+{
+  "segments": [
+    {
+      "text": "SPEAKER_00 ||  你好，今天我们来讲一下这个主题",
+      "start": 0.12,
+      "end": 5.43
+    },
+    {
+      "text": "SPEAKER_00 ||  第二段内容",
+      "start": 5.81,
+      "end": 9.22
+    }
+  ],
+  "language": "zh"
+}
+```
+
+说明：
+
+- 顶层只返回 `segments` 和 `language`
+- 每个 segment 只返回 `text`、`start`、`end`
+- 如果启用了 diarization 且识别到了 speaker，返回文本会拼成 `SPEAKER_00 ||  文本`
+- 如果没有 speaker 信息，`text` 就是纯转写文本

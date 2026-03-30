@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 LOGGER = logging.getLogger("whisperx_service")
 VIDEO_EXTENSIONS = {
@@ -76,34 +76,14 @@ class WhisperXConfig:
     default_diarize: bool = False
 
 
-class WordInfo(BaseModel):
-    word: str
-    start: Optional[float] = None
-    end: Optional[float] = None
-    score: Optional[float] = None
-    speaker: Optional[str] = None
-
-
 class SegmentInfo(BaseModel):
-    id: Optional[int] = None
     start: Optional[float] = None
     end: Optional[float] = None
     text: str
-    speaker: Optional[str] = None
-    avg_logprob: Optional[float] = None
-    words: List[WordInfo] = Field(default_factory=list)
-    chars: Optional[List[Dict[str, Any]]] = None
 
 
 class TranscribeResponse(BaseModel):
-    filename: str
-    model: str
-    task: str
     language: Optional[str] = None
-    batch_size: int
-    elapsed_ms: float
-    aligned: bool
-    diarized: bool
     segments: List[SegmentInfo]
 
 
@@ -262,16 +242,8 @@ class WhisperXRuntime:
                     )
                     result = self._whisperx.assign_word_speakers(diarize_segments, result)
 
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
             return TranscribeResponse(
-                filename=source_name,
-                model=self.config.model_name,
-                task=task or self.config.task,
                 language=result.get("language"),
-                batch_size=batch_size or self.config.batch_size,
-                elapsed_ms=round(elapsed_ms, 3),
-                aligned=effective_align,
-                diarized=effective_diarize,
                 segments=self._serialize_segments(result.get("segments", [])),
             )
         finally:
@@ -323,28 +295,17 @@ class WhisperXRuntime:
     def _serialize_segments(segments: List[Dict[str, Any]]) -> List[SegmentInfo]:
         output: List[SegmentInfo] = []
         for segment in segments:
-            words: List[WordInfo] = []
-            for word in segment.get("words") or []:
-                word_text = word.get("word") or word.get("text") or ""
-                words.append(
-                    WordInfo(
-                        word=str(word_text),
-                        start=_safe_float(word.get("start")),
-                        end=_safe_float(word.get("end")),
-                        score=_safe_float(word.get("score")),
-                        speaker=word.get("speaker"),
-                    )
-                )
+            raw_text = str(segment.get("text", "")).strip()
+            speaker = segment.get("speaker")
+            if speaker:
+                rendered_text = f"{speaker} ||  {raw_text}"
+            else:
+                rendered_text = raw_text
             output.append(
                 SegmentInfo(
-                    id=segment.get("id"),
                     start=_safe_float(segment.get("start")),
                     end=_safe_float(segment.get("end")),
-                    text=str(segment.get("text", "")).strip(),
-                    speaker=segment.get("speaker"),
-                    avg_logprob=_safe_float(segment.get("avg_logprob")),
-                    words=words,
-                    chars=segment.get("chars"),
+                    text=rendered_text,
                 )
             )
         return output
