@@ -40,8 +40,12 @@ RUN python3 -m pip install --upgrade pip setuptools wheel && \
 
 RUN mkdir -p /models/whisperx /models/.cache
 
-COPY requirements.txt /app/requirements.txt
-RUN python3 -m pip install -r /app/requirements.txt
+COPY --from=whisperx_src . /opt/whisperX
+RUN test -f /opt/whisperX/pyproject.toml
+RUN python3 -m pip install /opt/whisperX
+
+COPY requirements-docker.txt /app/requirements-docker.txt
+RUN python3 -m pip install -r /app/requirements-docker.txt
 
 COPY service.py /app/service.py
 COPY download_models.py /app/download_models.py

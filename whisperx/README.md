@@ -69,7 +69,9 @@ python3 service.py \
 
 ```bash
 cd /Users/rangers/DevelopServices/app/algo-asr-multi-plat/whisperx
-docker build -t whisperx-nvidia:latest .
+DOCKER_BUILDKIT=1 docker build \
+  --build-context whisperx_src=/path/to/local/whisperX \
+  -t whisperx-nvidia:latest .
 ```
 
 构建时把模型直接打进镜像：
@@ -78,6 +80,7 @@ docker build -t whisperx-nvidia:latest .
 cd /Users/rangers/DevelopServices/app/algo-asr-multi-plat/whisperx
 printf '%s' 'your_hf_token' > /tmp/hf_token.txt
 DOCKER_BUILDKIT=1 docker build \
+  --build-context whisperx_src=/path/to/local/whisperX \
   --secret id=hf_token,src=/tmp/hf_token.txt \
   --build-arg PRELOAD_MODELS=1 \
   --build-arg PRELOAD_MODEL_NAME=large-v3 \
@@ -90,6 +93,7 @@ rm -f /tmp/hf_token.txt
 
 说明：
 
+- `whisperx_src` 必须指向你宿主机上已经下载好的原生 WhisperX 源码目录，Docker 构建阶段不会再去 GitHub 拉代码
 - 这会在 `docker build` 阶段把 ASR、中文对齐模型、speaker diarization 模型直接下载进镜像内 `/models/whisperx`
 - 运行容器时不需要再传 `HF_TOKEN`
 - 需要先在 Hugging Face 上接受 `pyannote/speaker-diarization-community-1` 的访问条款
