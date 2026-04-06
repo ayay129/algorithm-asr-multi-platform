@@ -1,0 +1,43 @@
+{
+  "devices": [0, 1],
+  "output_root": "evaluate/results",
+  "hf_endpoint": "https://hf-mirror.com",
+  "scheduler_poll_seconds": 1.0,
+  "generate_plots": true,
+  "models": [
+    {
+      "name": "model_latin_ok",
+      "model_path": "/data0/test/AI-9-ASR/models/model_latin_ok/whisper-large-v3-turbo-finetune",
+      "generation_kwargs": {}
+    }
+  ],
+  "tasks": [
+    {
+      "name": "latin-test",
+      "whisper_language": "latin",
+      "dataset": {
+        "source_type": "json",
+        "data_files": "/data0/resources/dataset/test-latin100.json",
+        "split": "train",
+        "audio_column": "audio",
+        "text_column": "sentence",
+        "path_from_audio": true
+      },
+      "continue_on_error": false
+    },
+    {
+      "name": "zh-CN",
+      "whisper_language": "zh",
+      "dataset": {
+        "source_type": "huggingface",
+        "dataset_name": "google/fleurs",
+        "dataset_config": "cmn_hans_cn",
+        "split": "test[:100]",
+        "cache_dir": "/data0/hf-datasets",
+        "audio_column": "audio",
+        "text_column": "transcription"
+      },
+      "continue_on_error": false
+    }
+  ]
+}
