@@ -287,8 +287,6 @@ class WhisperXRuntime:
         effective_diarize = self.config.default_diarize if diarize is None else diarize
         if (task or self.config.task) == "translate":
             effective_align = False
-        if effective_diarize:
-            effective_align = True
 
         started = time.perf_counter()
         status = "ok"
@@ -587,6 +585,7 @@ def create_app(runtime: WhisperXRuntime) -> FastAPI:
         }
 
     @app.post("/", response_model=TranscribeResponse)
+    @app.post("/transcribe", response_model=TranscribeResponse)
     @app.post("/v1/transcriptions", response_model=TranscribeResponse)
     @app.post("/v1/audio/transcriptions", response_model=TranscribeResponse)
     async def transcribe_upload(
@@ -711,11 +710,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diarize-model", default="pyannote/speaker-diarization-3.1", help="Diarization model name")
     parser.add_argument(
         "--diarize-cache-mode",
-        default="offload",
+        default="keep",
         choices=["offload", "keep"],
         help="Diarization model cache mode. offload frees GPU memory after each diarize request.",
     )
-    parser.add_argument("--default-align", action="store_true", default=True, help="Enable alignment by default")
+    parser.add_argument("--default-align", action="store_true", default=False, help="Enable alignment by default")
     parser.add_argument("--disable-default-align", action="store_true", help="Disable alignment by default")
     parser.add_argument("--default-diarize", action="store_true", help="Enable diarization by default")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host")
