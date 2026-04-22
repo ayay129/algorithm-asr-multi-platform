@@ -13,6 +13,7 @@ This service is intentionally small and follows the upstream WhisperX Python API
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import importlib
 import logging
@@ -56,10 +57,43 @@ def _env_int(name: str, default: int) -> int:
 
 
 FFMPEG_THREADS = _env_int("ASR_FFMPEG_THREADS", 1)
+MALLOC_TRIM_ENABLED = _env_int("ASR_MALLOC_TRIM", 1) == 1
 
 
 def _elapsed_ms(started_at: float) -> float:
     return round((time.perf_counter() - started_at) * 1000.0, 2)
+
+
+def _current_rss_mb() -> Optional[float]:
+    status_path = Path("/proc/self/status")
+    if status_path.is_file():
+        try:
+            for line in status_path.read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    return round(rss_kb / 1024.0, 2)
+        except Exception:
+            pass
+
+    statm_path = Path("/proc/self/statm")
+    if statm_path.is_file():
+        try:
+            rss_pages = int(statm_path.read_text().split()[1])
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return round((rss_pages * page_size) / (1024.0 * 1024.0), 2)
+        except Exception:
+            pass
+    return None
+
+
+def _trim_process_heap() -> bool:
+    if not MALLOC_TRIM_ENABLED or os.name != "posix":
+        return False
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        return bool(libc.malloc_trim(0))
+    except Exception:
+        return False
 
 
 @dataclass
@@ -190,6 +224,17 @@ class WhisperXRuntime:
         self._diarization_pipeline_class = None
         self._asr_model = self._load_asr_model()
         self._diarize_pipeline = None
+        LOGGER.info(
+            "whisperx runtime initialized: diarize_cache_mode=%s default_diarize=%s rss_mb=%s",
+            self.config.diarize_cache_mode,
+            self.config.default_diarize,
+            _current_rss_mb(),
+        )
+        if self.config.diarize_cache_mode == "keep":
+            LOGGER.warning(
+                "diarize_cache_mode=keep retains diarization pipeline in process memory; "
+                "use offload if you need stable RSS under long-running traffic"
+            )
 
     def _load_asr_model(self):
         LOGGER.info(
@@ -260,7 +305,7 @@ class WhisperXRuntime:
             return
         if self.config.diarize_cache_mode == "keep" and pipeline is self._diarize_pipeline:
             return
-        self._release_torch_objects(pipeline)
+        self._release_torch_objects(pipeline, trim_heap=True)
 
     def transcribe_file(
         self,
@@ -310,6 +355,7 @@ class WhisperXRuntime:
         align_metadata = None
         diarize_pipeline = None
         diarize_segments = None
+        rss_before_mb = _current_rss_mb()
         if self._is_video_input(source_name, content_type):
             extract_started = time.perf_counter()
             audio_path = self._extract_audio_from_video(path)
@@ -381,17 +427,20 @@ class WhisperXRuntime:
                             len(result.get("segments", [])),
                         )
                     finally:
-                        self._release_torch_objects(align_model, align_metadata)
+                        self._release_torch_objects(align_model, align_metadata, trim_heap=True)
                         align_model = None
                         align_metadata = None
 
                 if effective_diarize:
                     diarize_load_started = time.perf_counter()
+                    diarize_rss_before_mb = _current_rss_mb()
                     diarize_pipeline = self._get_diarize_pipeline()
                     LOGGER.info(
-                        "request=%s stage=diarize_model_load duration_ms=%.2f",
+                        "request=%s stage=diarize_model_load duration_ms=%.2f rss_before_mb=%s rss_after_mb=%s",
                         request_id,
                         _elapsed_ms(diarize_load_started),
+                        diarize_rss_before_mb,
+                        _current_rss_mb(),
                     )
                     diarize_started = time.perf_counter()
                     diarize_segments = diarize_pipeline(
@@ -400,17 +449,19 @@ class WhisperXRuntime:
                         max_speakers=max_speakers,
                     )
                     LOGGER.info(
-                        "request=%s stage=diarize duration_ms=%.2f diarize_segments=%s",
+                        "request=%s stage=diarize duration_ms=%.2f diarize_segments=%s rss_mb=%s",
                         request_id,
                         _elapsed_ms(diarize_started),
                         len(diarize_segments) if hasattr(diarize_segments, "__len__") else "unknown",
+                        _current_rss_mb(),
                     )
                     assign_started = time.perf_counter()
                     result = self._whisperx.assign_word_speakers(diarize_segments, result)
                     LOGGER.info(
-                        "request=%s stage=assign_speakers duration_ms=%.2f",
+                        "request=%s stage=assign_speakers duration_ms=%.2f rss_mb=%s",
                         request_id,
                         _elapsed_ms(assign_started),
+                        _current_rss_mb(),
                     )
 
             serialize_started = time.perf_counter()
@@ -434,15 +485,25 @@ class WhisperXRuntime:
             result = None
             diarize_segments = None
             diarize_pipeline = None
+            if self.config.diarize_cache_mode == "offload":
+                gc.collect()
+                _trim_process_heap()
+            rss_after_mb = _current_rss_mb()
+            rss_delta_mb = None
+            if rss_before_mb is not None and rss_after_mb is not None:
+                rss_delta_mb = round(rss_after_mb - rss_before_mb, 2)
             for item in cleanup_paths:
                 Path(item).unlink(missing_ok=True)
             LOGGER.info(
-                "request=%s transcribe finished status=%s total_ms=%.2f detected_language=%s cleanup_paths=%s",
+                "request=%s transcribe finished status=%s total_ms=%.2f detected_language=%s cleanup_paths=%s rss_before_mb=%s rss_after_mb=%s rss_delta_mb=%s",
                 request_id,
                 status,
                 _elapsed_ms(started),
                 detected_language,
                 len(cleanup_paths),
+                rss_before_mb,
+                rss_after_mb,
+                rss_delta_mb,
             )
 
     def transcribe_bytes(
@@ -503,7 +564,7 @@ class WhisperXRuntime:
         return output
 
     @staticmethod
-    def _release_torch_objects(*objects: Any) -> None:
+    def _release_torch_objects(*objects: Any, trim_heap: bool = False) -> None:
         for obj in objects:
             try:
                 del obj
@@ -516,6 +577,8 @@ class WhisperXRuntime:
                 torch.cuda.empty_cache()
         except Exception:
             pass
+        if trim_heap:
+            _trim_process_heap()
 
     @staticmethod
     def _is_video_input(filename: str, content_type: Optional[str]) -> bool:
@@ -710,9 +773,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diarize-model", default="pyannote/speaker-diarization-3.1", help="Diarization model name")
     parser.add_argument(
         "--diarize-cache-mode",
-        default="keep",
+        default="offload",
         choices=["offload", "keep"],
-        help="Diarization model cache mode. offload frees GPU memory after each diarize request.",
+        help="Diarization model cache mode. offload frees diarization-related memory after each diarize request.",
     )
     parser.add_argument("--default-align", action="store_true", default=False, help="Enable alignment by default")
     parser.add_argument("--disable-default-align", action="store_true", help="Disable alignment by default")

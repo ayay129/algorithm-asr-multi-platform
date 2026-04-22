@@ -39,8 +39,8 @@ python3 service.py \
 
 - 上传文件按分块落盘，不会整包读入内存。
 - `--download-root /models/whisperx --local-files-only` 会强制只从固定目录加载模型，不在服务运行时临时下载。
-- `--diarize-cache-mode offload` 是默认值，请求做完 diarization 后会主动释放对应显存。
-- 如果你的业务大量依赖 diarization，想用显存换速度，再改成 `--diarize-cache-mode keep`。
+- `--diarize-cache-mode offload` 是默认值，请求做完 diarization 后会主动释放对应的 diarization CPU/GPU 内存，适合作为线上默认模式。
+- 如果你的业务大量依赖 diarization，想用内存换速度，再改成 `--diarize-cache-mode keep`；`keep` 会把 diarization pipeline 常驻在进程里，RSS 不会维持在低水位。
 
 ## Docker
 
