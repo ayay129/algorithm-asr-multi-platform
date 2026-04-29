@@ -17,6 +17,7 @@ import ctypes
 import gc
 import importlib
 import logging
+import math
 import os
 import subprocess
 import tempfile
@@ -56,8 +57,19 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        LOGGER.warning("invalid %s=%s, fallback to %s", name, raw, default)
+        return default
+
+
 FFMPEG_THREADS = _env_int("ASR_FFMPEG_THREADS", 1)
 MALLOC_TRIM_ENABLED = _env_int("ASR_MALLOC_TRIM", 1) == 1
+MAX_UPLOAD_BYTES = _env_int("ASR_MAX_UPLOAD_BYTES", 512 * 1024 * 1024)
+MAX_MEDIA_DURATION_SECONDS = _env_float("ASR_MAX_MEDIA_DURATION_SECONDS", 7200.0)
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -86,6 +98,26 @@ def _current_rss_mb() -> Optional[float]:
     return None
 
 
+def _current_cuda_memory_mb(device: str, device_index: int) -> Optional[Dict[str, float]]:
+    if not device.startswith("cuda"):
+        return None
+    try:
+        import torch  # type: ignore
+
+        if not torch.cuda.is_available():
+            return None
+        cuda_device = torch.device(device if ":" in device else f"cuda:{device_index}")
+        free_bytes, total_bytes = torch.cuda.mem_get_info(cuda_device)
+        return {
+            "torch_allocated": round(torch.cuda.memory_allocated(cuda_device) / (1024.0 * 1024.0), 2),
+            "torch_reserved": round(torch.cuda.memory_reserved(cuda_device) / (1024.0 * 1024.0), 2),
+            "device_free": round(free_bytes / (1024.0 * 1024.0), 2),
+            "device_total": round(total_bytes / (1024.0 * 1024.0), 2),
+        }
+    except Exception:
+        return None
+
+
 def _trim_process_heap() -> bool:
     if not MALLOC_TRIM_ENABLED or os.name != "posix":
         return False
@@ -94,6 +126,10 @@ def _trim_process_heap() -> bool:
         return bool(libc.malloc_trim(0))
     except Exception:
         return False
+
+
+class InputTooLargeError(ValueError):
+    """Raised when an upload or media input exceeds service guardrails."""
 
 
 @dataclass
@@ -111,7 +147,7 @@ class WhisperXConfig:
     hf_token: Optional[str] = None
     align_model: Optional[str] = None
     diarize_model: str = "pyannote/speaker-diarization-3.1"
-    diarize_cache_mode: str = "offload"
+    diarize_cache_mode: str = "keep"
     default_align: bool = True
     default_diarize: bool = False
 
@@ -225,16 +261,37 @@ class WhisperXRuntime:
         self._asr_model = self._load_asr_model()
         self._diarize_pipeline = None
         LOGGER.info(
-            "whisperx runtime initialized: diarize_cache_mode=%s default_diarize=%s rss_mb=%s",
+            "whisperx runtime initialized: diarize_cache_mode=%s default_diarize=%s memory=%s",
             self.config.diarize_cache_mode,
             self.config.default_diarize,
-            _current_rss_mb(),
+            self._memory_snapshot(),
         )
+        if self.config.default_diarize and self.config.diarize_cache_mode == "offload":
+            LOGGER.warning(
+                "default_diarize=true with diarize_cache_mode=offload repeatedly reloads diarization models; "
+                "use diarize_cache_mode=keep for stable RSS under long-running traffic"
+            )
         if self.config.diarize_cache_mode == "keep":
             LOGGER.warning(
-                "diarize_cache_mode=keep retains diarization pipeline in process memory; "
-                "use offload if you need stable RSS under long-running traffic"
+                "diarize_cache_mode=keep retains diarization pipeline in process memory once loaded; "
+                "this raises baseline RSS but avoids per-request diarization reload churn"
             )
+            if self.config.default_diarize:
+                preload_started = time.perf_counter()
+                memory_before = self._memory_snapshot()
+                self._diarize_pipeline = self._create_diarize_pipeline()
+                LOGGER.info(
+                    "diarization pipeline preloaded duration_ms=%.2f memory_before=%s memory_after=%s",
+                    _elapsed_ms(preload_started),
+                    memory_before,
+                    self._memory_snapshot(),
+                )
+
+    def _memory_snapshot(self) -> Dict[str, Any]:
+        return {
+            "rss_mb": _current_rss_mb(),
+            "cuda_mb": _current_cuda_memory_mb(self.config.device, self.config.device_index),
+        }
 
     def _load_asr_model(self):
         LOGGER.info(
@@ -356,6 +413,7 @@ class WhisperXRuntime:
         diarize_pipeline = None
         diarize_segments = None
         rss_before_mb = _current_rss_mb()
+        media_duration_seconds = self._validate_media_duration(path, request_id)
         if self._is_video_input(source_name, content_type):
             extract_started = time.perf_counter()
             audio_path = self._extract_audio_from_video(path)
@@ -371,17 +429,20 @@ class WhisperXRuntime:
             load_audio_started = time.perf_counter()
             audio = self._whisperx.load_audio(audio_path)
             LOGGER.info(
-                "request=%s stage=load_audio duration_ms=%.2f sample_count=%s",
+                "request=%s stage=load_audio duration_ms=%.2f sample_count=%s audio_duration_seconds=%s memory=%s",
                 request_id,
                 _elapsed_ms(load_audio_started),
                 len(audio) if hasattr(audio, "__len__") else "unknown",
+                round(len(audio) / 16000.0, 2) if hasattr(audio, "__len__") else media_duration_seconds,
+                self._memory_snapshot(),
             )
             lock_wait_started = time.perf_counter()
             with self._lock:
                 LOGGER.info(
-                    "request=%s stage=model_lock_acquired wait_ms=%.2f",
+                    "request=%s stage=model_lock_acquired wait_ms=%.2f memory=%s",
                     request_id,
                     _elapsed_ms(lock_wait_started),
+                    self._memory_snapshot(),
                 )
                 asr_started = time.perf_counter()
                 result = self._asr_model.transcribe(
@@ -392,11 +453,12 @@ class WhisperXRuntime:
                 )
                 detected_language = result.get("language") or detected_language
                 LOGGER.info(
-                    "request=%s stage=asr duration_ms=%.2f detected_language=%s segments=%s",
+                    "request=%s stage=asr duration_ms=%.2f detected_language=%s segments=%s memory=%s",
                     request_id,
                     _elapsed_ms(asr_started),
                     detected_language,
                     len(result.get("segments", [])),
+                    self._memory_snapshot(),
                 )
 
                 if effective_align and result.get("segments"):
@@ -405,10 +467,11 @@ class WhisperXRuntime:
                     align_load_started = time.perf_counter()
                     align_model, align_metadata = self._load_align_model(detected_language)
                     LOGGER.info(
-                        "request=%s stage=align_model_load duration_ms=%.2f language=%s",
+                        "request=%s stage=align_model_load duration_ms=%.2f language=%s memory=%s",
                         request_id,
                         _elapsed_ms(align_load_started),
                         detected_language,
+                        self._memory_snapshot(),
                     )
                     try:
                         align_started = time.perf_counter()
@@ -421,26 +484,28 @@ class WhisperXRuntime:
                             return_char_alignments=return_char_alignments,
                         )
                         LOGGER.info(
-                            "request=%s stage=align duration_ms=%.2f aligned_segments=%s",
+                            "request=%s stage=align duration_ms=%.2f aligned_segments=%s memory=%s",
                             request_id,
                             _elapsed_ms(align_started),
                             len(result.get("segments", [])),
+                            self._memory_snapshot(),
                         )
                     finally:
                         align_model = None
                         align_metadata = None
                         self._release_torch_objects(trim_heap=True)
+                        LOGGER.info("request=%s stage=align_release memory=%s", request_id, self._memory_snapshot())
 
                 if effective_diarize:
                     diarize_load_started = time.perf_counter()
-                    diarize_rss_before_mb = _current_rss_mb()
+                    diarize_memory_before = self._memory_snapshot()
                     diarize_pipeline = self._get_diarize_pipeline()
                     LOGGER.info(
-                        "request=%s stage=diarize_model_load duration_ms=%.2f rss_before_mb=%s rss_after_mb=%s",
+                        "request=%s stage=diarize_model_load duration_ms=%.2f memory_before=%s memory_after=%s",
                         request_id,
                         _elapsed_ms(diarize_load_started),
-                        diarize_rss_before_mb,
-                        _current_rss_mb(),
+                        diarize_memory_before,
+                        self._memory_snapshot(),
                     )
                     diarize_started = time.perf_counter()
                     diarize_segments = diarize_pipeline(
@@ -449,19 +514,19 @@ class WhisperXRuntime:
                         max_speakers=max_speakers,
                     )
                     LOGGER.info(
-                        "request=%s stage=diarize duration_ms=%.2f diarize_segments=%s rss_mb=%s",
+                        "request=%s stage=diarize duration_ms=%.2f diarize_segments=%s memory=%s",
                         request_id,
                         _elapsed_ms(diarize_started),
                         len(diarize_segments) if hasattr(diarize_segments, "__len__") else "unknown",
-                        _current_rss_mb(),
+                        self._memory_snapshot(),
                     )
                     assign_started = time.perf_counter()
                     result = self._whisperx.assign_word_speakers(diarize_segments, result)
                     LOGGER.info(
-                        "request=%s stage=assign_speakers duration_ms=%.2f rss_mb=%s",
+                        "request=%s stage=assign_speakers duration_ms=%.2f memory=%s",
                         request_id,
                         _elapsed_ms(assign_started),
-                        _current_rss_mb(),
+                        self._memory_snapshot(),
                     )
 
             serialize_started = time.perf_counter()
@@ -494,7 +559,7 @@ class WhisperXRuntime:
             for item in cleanup_paths:
                 Path(item).unlink(missing_ok=True)
             LOGGER.info(
-                "request=%s transcribe finished status=%s total_ms=%.2f detected_language=%s cleanup_paths=%s rss_before_mb=%s rss_after_mb=%s rss_delta_mb=%s",
+                "request=%s transcribe finished status=%s total_ms=%.2f detected_language=%s cleanup_paths=%s rss_before_mb=%s rss_after_mb=%s rss_delta_mb=%s memory=%s",
                 request_id,
                 status,
                 _elapsed_ms(started),
@@ -503,6 +568,7 @@ class WhisperXRuntime:
                 rss_before_mb,
                 rss_after_mb,
                 rss_delta_mb,
+                self._memory_snapshot(),
             )
 
     def transcribe_bytes(
@@ -561,6 +627,61 @@ class WhisperXRuntime:
                 )
             )
         return output
+
+    def _validate_media_duration(self, path: str, request_id: str) -> Optional[float]:
+        if MAX_MEDIA_DURATION_SECONDS <= 0:
+            return None
+        duration_seconds = self._probe_media_duration(path)
+        LOGGER.info(
+            "request=%s stage=media_probe duration_seconds=%s max_duration_seconds=%s",
+            request_id,
+            duration_seconds,
+            MAX_MEDIA_DURATION_SECONDS,
+        )
+        if duration_seconds is not None and duration_seconds > MAX_MEDIA_DURATION_SECONDS:
+            raise InputTooLargeError(
+                f"Media duration {duration_seconds:.2f}s exceeds limit "
+                f"ASR_MAX_MEDIA_DURATION_SECONDS={MAX_MEDIA_DURATION_SECONDS:.2f}s"
+            )
+        return duration_seconds
+
+    @staticmethod
+    def _probe_media_duration(path: str) -> Optional[float]:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
+        try:
+            completed = subprocess.run(cmd, capture_output=True, check=True, text=True, timeout=30)
+        except FileNotFoundError:
+            LOGGER.warning("ffprobe not found; media duration guardrail is disabled for this request")
+            return None
+        except subprocess.TimeoutExpired:
+            LOGGER.warning("ffprobe timed out for path=%s; media duration guardrail is skipped", path)
+            return None
+        except subprocess.CalledProcessError as exc:
+            LOGGER.warning(
+                "ffprobe failed for path=%s; media duration guardrail is skipped: %s",
+                path,
+                exc.stderr.strip() if exc.stderr else exc,
+            )
+            return None
+        raw_duration = completed.stdout.strip().splitlines()
+        if not raw_duration:
+            return None
+        try:
+            duration_seconds = float(raw_duration[-1])
+        except ValueError:
+            return None
+        if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+            return None
+        return round(duration_seconds, 2)
 
     @staticmethod
     def _release_torch_objects(trim_heap: bool = False) -> None:
@@ -641,6 +762,8 @@ def create_app(runtime: WhisperXRuntime) -> FastAPI:
             "compute_type": runtime.config.compute_type,
             "default_batch_size": runtime.config.batch_size,
             "diarize_cache_mode": runtime.config.diarize_cache_mode,
+            "max_upload_bytes": MAX_UPLOAD_BYTES,
+            "max_media_duration_seconds": MAX_MEDIA_DURATION_SECONDS,
         }
 
     @app.post("/", response_model=TranscribeResponse)
@@ -713,6 +836,8 @@ def create_app(runtime: WhisperXRuntime) -> FastAPI:
             return response
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InputTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -741,6 +866,10 @@ async def _persist_upload_to_tempfile(file: UploadFile, chunk_size: int = 1024 *
                 chunk = await file.read(chunk_size)
                 if not chunk:
                     break
+                if MAX_UPLOAD_BYTES > 0 and total_written + len(chunk) > MAX_UPLOAD_BYTES:
+                    raise InputTooLargeError(
+                        f"Upload size exceeds limit ASR_MAX_UPLOAD_BYTES={MAX_UPLOAD_BYTES} bytes"
+                    )
                 temp_file.write(chunk)
                 total_written += len(chunk)
         except Exception:
@@ -769,9 +898,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diarize-model", default="pyannote/speaker-diarization-3.1", help="Diarization model name")
     parser.add_argument(
         "--diarize-cache-mode",
-        default="offload",
+        default="keep",
         choices=["offload", "keep"],
-        help="Diarization model cache mode. offload frees diarization-related memory after each diarize request.",
+        help="Diarization model cache mode. keep avoids per-request model reload churn; offload is for infrequent diarization.",
     )
     parser.add_argument("--default-align", action="store_true", default=False, help="Enable alignment by default")
     parser.add_argument("--disable-default-align", action="store_true", help="Disable alignment by default")

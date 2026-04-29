@@ -11,7 +11,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HUGGINGFACE_HUB_CACHE=/models/whisperx \
     XDG_CACHE_HOME=/models/.cache \
     MALLOC_ARENA_MAX=2 \
-    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+    ASR_MAX_UPLOAD_BYTES=536870912 \
+    ASR_MAX_MEDIA_DURATION_SECONDS=7200
 
 WORKDIR /app
 
@@ -23,7 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     libgomp1 \
-    libjemalloc2 \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
@@ -49,4 +49,4 @@ COPY README.md /app/README.md
 
 EXPOSE 8000
 
-CMD ["python3", "/app/service.py", "--model", "large-v3", "--device", "cuda", "--device-index", "0", "--compute-type", "float16", "--batch-size", "16", "--download-root", "/models/whisperx", "--local-files-only", "--diarize-model", "pyannote/speaker-diarization-community-1", "--diarize-cache-mode", "offload", "--default-diarize", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "/app/service.py", "--model", "large-v3", "--device", "cuda", "--device-index", "0", "--compute-type", "float16", "--batch-size", "16", "--download-root", "/models/whisperx", "--local-files-only", "--diarize-model", "pyannote/speaker-diarization-community-1", "--diarize-cache-mode", "keep", "--default-diarize", "--host", "0.0.0.0", "--port", "8000"]

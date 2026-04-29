@@ -30,7 +30,8 @@ python3 service.py \
   --batch-size 16 \
   --download-root /models/whisperx \
   --local-files-only \
-  --diarize-cache-mode offload \
+  --diarize-cache-mode keep \
+  --default-diarize \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -39,8 +40,10 @@ python3 service.py \
 
 - 上传文件按分块落盘，不会整包读入内存。
 - `--download-root /models/whisperx --local-files-only` 会强制只从固定目录加载模型，不在服务运行时临时下载。
-- `--diarize-cache-mode offload` 是默认值，请求做完 diarization 后会主动释放对应的 diarization CPU/GPU 内存，适合作为线上默认模式。
-- 如果你的业务大量依赖 diarization，想用内存换速度，再改成 `--diarize-cache-mode keep`；`keep` 会把 diarization pipeline 常驻在进程里，RSS 不会维持在低水位。
+- 如果线上默认开启 speaker diarization，推荐使用 `--diarize-cache-mode keep`。它会提高进程基线 RSS，但避免 pyannote pipeline 每个请求重复加载/释放导致长期 RSS 高水位爬升。
+- `--diarize-cache-mode offload` 只适合很少使用 diarization 的场景；如果和 `--default-diarize` 一起长期运行，服务会打印 warning。
+- `ASR_MAX_UPLOAD_BYTES` 默认 `536870912`，超过后返回 413；设为 `0` 可关闭上传大小限制。
+- `ASR_MAX_MEDIA_DURATION_SECONDS` 默认 `7200`，通过 `ffprobe` 在解码前拦截过长音视频；设为 `0` 可关闭时长限制。
 
 ## Docker
 
@@ -94,6 +97,14 @@ docker run -d \
   whisperx-nvidia:offline-zh
 ```
 
+内存监控：
+
+```bash
+ASR_MT_LOG=largev3.log ASR_MT_MATCH=large-v3 ASR_MT_INTERVAL=30 bash mt.sh
+```
+
+`mt.sh` 会记录匹配进程的 VIRT/RES、每轮总 RES，以及 `nvidia-smi` 能看到的进程显存。排查 OOM 时重点看 `TOTAL_RES` 是否持续爬升，以及同一时间 GPU 显存是否也接近上限。
+
 ## 调用
 
 ```bash
@@ -111,7 +122,7 @@ curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
 - `min_speakers`
 - `max_speakers`
 - `return_char_alignments=true|false`
-- 服务级参数：`--diarize-cache-mode offload|keep`
+- 服务级参数：`--diarize-cache-mode keep|offload`，默认 `keep`
 
 ## 返回
 
