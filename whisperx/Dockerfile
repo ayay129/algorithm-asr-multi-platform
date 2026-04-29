@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
