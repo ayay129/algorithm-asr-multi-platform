@@ -9,7 +9,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/models/whisperx \
     TRANSFORMERS_CACHE=/models/whisperx \
     HUGGINGFACE_HUB_CACHE=/models/whisperx \
-    XDG_CACHE_HOME=/models/.cache
+    XDG_CACHE_HOME=/models/.cache \
+    MALLOC_ARENA_MAX=2 \
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 
 WORKDIR /app
 
@@ -21,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     libgomp1 \
+    libjemalloc2 \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 

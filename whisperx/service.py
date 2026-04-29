@@ -300,12 +300,12 @@ class WhisperXRuntime:
             return self._diarize_pipeline
         return self._create_diarize_pipeline()
 
-    def _release_diarize_pipeline(self, pipeline: Any) -> None:
+    def _should_drop_diarize_pipeline(self, pipeline: Any) -> bool:
         if pipeline is None:
-            return
+            return False
         if self.config.diarize_cache_mode == "keep" and pipeline is self._diarize_pipeline:
-            return
-        self._release_torch_objects(pipeline, trim_heap=True)
+            return False
+        return True
 
     def transcribe_file(
         self,
@@ -427,9 +427,9 @@ class WhisperXRuntime:
                             len(result.get("segments", [])),
                         )
                     finally:
-                        self._release_torch_objects(align_model, align_metadata, trim_heap=True)
                         align_model = None
                         align_metadata = None
+                        self._release_torch_objects(trim_heap=True)
 
                 if effective_diarize:
                     diarize_load_started = time.perf_counter()
@@ -480,14 +480,13 @@ class WhisperXRuntime:
             status = "error"
             raise
         finally:
-            self._release_diarize_pipeline(diarize_pipeline)
+            drop_pipeline = self._should_drop_diarize_pipeline(diarize_pipeline)
             audio = None
             result = None
             diarize_segments = None
-            diarize_pipeline = None
-            if self.config.diarize_cache_mode == "offload":
-                gc.collect()
-                _trim_process_heap()
+            if drop_pipeline:
+                diarize_pipeline = None
+            self._release_torch_objects(trim_heap=True)
             rss_after_mb = _current_rss_mb()
             rss_delta_mb = None
             if rss_before_mb is not None and rss_after_mb is not None:
@@ -564,12 +563,9 @@ class WhisperXRuntime:
         return output
 
     @staticmethod
-    def _release_torch_objects(*objects: Any, trim_heap: bool = False) -> None:
-        for obj in objects:
-            try:
-                del obj
-            except Exception:
-                pass
+    def _release_torch_objects(trim_heap: bool = False) -> None:
+        # Caller must drop its own references first — `del` of a parameter
+        # only unbinds the local name, not the caller's binding.
         gc.collect()
         try:
             import torch  # type: ignore
