@@ -15,7 +15,7 @@ __pycache__/
 .env
 .venv/
 venv/
-
+**/models/
 # Runtime logs
 *.log
 logs/
